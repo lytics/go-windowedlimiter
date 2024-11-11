@@ -10,6 +10,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestRateLimiterBasic(t *testing.T) {
@@ -17,12 +19,19 @@ func TestRateLimiterBasic(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
+
+	zl, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	// zl = zap.NewNop()
+
+	cleanup := Init(rdb, *zl)
+	defer cleanup()
 	defer rdb.Close()
 
 	key := fmt.Sprintf("%d", os.Getpid())
 	rate := int64(10)
 	interval := 100 * time.Millisecond
-	limiter := NewRateLimiter(rdb, key, rate, interval)
+	limiter := NewRateLimiter(key, rate, interval)
 
 	// avoid testing over the first interval wrap, which can cause more requests to
 	// be allowed
@@ -53,13 +62,19 @@ func TestRateLimiterConcurrent(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
 	})
+	zl, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	// zl = zap.NewNop()
+
+	cleanup := Init(rdb, *zl)
+	defer cleanup()
 	defer rdb.Close()
 
 	key := fmt.Sprintf("%d", os.Getpid())
 	interval := 1000 * time.Millisecond
 	granularity := 100 * time.Millisecond
 	rate := int64(100)
-	limiter := NewRateLimiter(rdb, key, rate, interval)
+	limiter := NewRateLimiter(key, rate, interval)
 
 	var wg sync.WaitGroup
 

@@ -3,7 +3,7 @@ package slidingwindow
 import (
 	"context"
 	"fmt"
-	"math"
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -14,7 +14,10 @@ import (
 )
 
 var (
-	mitigationCache      = sync.Map{}
+	rdb             redis.Cmdable
+	zl              zap.Logger
+	mitigationCache = sync.Map{}
+	// these could use prom/otel but I'm avoiding the dependency for now
 	allows               atomic.Uint64
 	denies               atomic.Uint64
 	mitigatedCacheMisses atomic.Uint64
@@ -28,73 +31,83 @@ var (
 	redisErrors          atomic.Uint64
 )
 
-func mitigationCacheCleaner() {
-	time.Sleep(time.Minute)
-	mitigationCache.Range(func(key, u any) bool {
-		if time.Now().After(u.(time.Time)) {
-			mitigationCache.Delete(key)
-		}
-		return false
-	})
-}
-
 type incrOp struct {
-	rdb      redis.Cmdable
 	key      string
 	interval time.Duration
 }
 
-var incrChan = make(chan incrOp, 1)
+var (
+	incrChan            = make(chan incrOp, 1)
+	cleanerStopChan     = make(chan struct{})
+	incrementerStopChan = make(chan struct{})
+)
 
-func incrementer() {
-	for op := range incrChan {
-		res, err := op.rdb.Incr(context.Background(), op.key).Result()
-		if err == nil && res == 1 {
-			op.rdb.ExpireNX(context.Background(), op.key, max(3*op.interval, time.Second))
-			redisExpireNXs.Add(1)
-		}
-		redisIncrs.Add(1)
-		if err != nil {
-			redisErrors.Add(1)
+func mitigationCacheCleaner() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-cleanerStopChan:
+			return
+		case <-ticker.C:
+			mitigationCache.Range(func(key, u any) bool {
+				if time.Now().After(u.(time.Time)) {
+					mitigationCache.Delete(key)
+				}
+				return false
+			})
 		}
 	}
 }
 
-func init() {
+func incrementer() {
+	for {
+		select {
+		case <-incrementerStopChan:
+			return
+		case op := <-incrChan:
+			res, err := rdb.Incr(context.Background(), op.key).Result()
+			if err == nil && res == 1 {
+				rdb.ExpireNX(context.Background(), op.key, max(3*op.interval, time.Second))
+				redisExpireNXs.Add(1)
+			}
+			redisIncrs.Add(1)
+			if err != nil {
+				redisErrors.Add(1)
+			}
+		}
+	}
+}
+
+func Init(r redis.Cmdable, z zap.Logger) func() {
+	rdb = r
+	zl = z
 	go mitigationCacheCleaner()
 	go incrementer()
+	return func() {
+		close(cleanerStopChan)
+		close(incrementerStopChan)
+	}
 }
 
 type Options struct {
 	FailClosed bool
-	ZapLogger  *zap.Logger
 }
 
 type RateLimiter struct {
-	rdb      redis.Cmdable
 	key      string
 	rate     int64
 	interval time.Duration
 	options  Options
 }
 
-func NewRateLimiter(rdb redis.Cmdable, key string, rate int64, interval time.Duration, opt ...Options) *RateLimiter {
+func NewRateLimiter(key string, rate int64, interval time.Duration, opt ...Options) *RateLimiter {
 	var options Options
 	if len(opt) > 0 {
 		options = opt[0]
 	}
-	if options.ZapLogger == nil {
-
-		zl, err := zap.NewDevelopment()
-		if err != nil {
-			panic(err)
-		}
-
-		zl = zap.NewNop()
-		options.ZapLogger = zl
-	}
 	return &RateLimiter{
-		rdb:      rdb,
 		key:      key,
 		rate:     rate,
 		interval: interval,
@@ -102,21 +115,31 @@ func NewRateLimiter(rdb redis.Cmdable, key string, rate int64, interval time.Dur
 	}
 }
 
-func (rl *RateLimiter) Allow(ctx context.Context) (ret bool) {
+func (rl *RateLimiter) failMaybe() time.Time {
+	if rl.options.FailClosed {
+		return time.Now().Add(rl.interval)
+	}
+	return time.Time{}
+}
+
+func (rl *RateLimiter) AllowWithUntil(ctx context.Context) (notUntil time.Time) {
+	notUntil = time.Time{}
 	defer func() {
-		if ret {
+		if time.Now().Before(notUntil) {
 			allows.Add(1)
 		} else {
 			denies.Add(1)
 		}
 	}()
-	if rl.isMitigated(ctx) {
-		return false
+
+	until := rl.mitigatedUntil(ctx)
+	if time.Now().Before(until) {
+		return until
 	}
 	now := time.Now()
 	curIntStart := now.Truncate(rl.interval)
 	prevIntStart := curIntStart.Add(-rl.interval)
-	intervals, err := rl.rdb.MGet(ctx,
+	intervals, err := rdb.MGet(ctx,
 		fmt.Sprintf("{%s}.%d", rl.key, curIntStart.UnixNano()),
 		fmt.Sprintf("{%s}.%d", rl.key, prevIntStart.UnixNano()),
 	).Result()
@@ -124,29 +147,24 @@ func (rl *RateLimiter) Allow(ctx context.Context) (ret bool) {
 	if err != nil {
 		// we failed talking to redis here so we do /not/ try to do any other commands
 		// to it, especially not trying to write to a node that can't even do a read
-		rl.options.ZapLogger.Error("getting intervals", zap.Error(err))
+		zl.Error("getting intervals", zap.Error(err))
 		redisErrors.Add(1)
-		return !rl.options.FailClosed
+		return rl.failMaybe()
 	}
 
 	// after this point we do want to try to increment the current interval if we allow the request
 	defer func() {
-		if ret {
+		if time.Now().After(notUntil) {
 			curKey := fmt.Sprintf("{%s}.%d", rl.key, curIntStart.UnixNano())
-			incrChan <- incrOp{rdb: rl.rdb, key: curKey, interval: rl.interval}
-		} else {
-			// right now this is mitigating based on the portion of the window that has
-			// to pass for it to be possible to get an allow (unless my math is wrong).
-			// This causes a ridiculous number of hits to redis though
-			rl.mitigate(ctx, curIntStart.Add(time.Duration(rl.interval.Nanoseconds()/rl.rate)))
+			incrChan <- incrOp{key: curKey, interval: rl.interval}
 		}
 	}()
 	if intervals[0] != nil {
 		curr, err := strconv.ParseInt(intervals[0].(string), 10, 64)
 		if err != nil {
-			return !rl.options.FailClosed
+			return rl.failMaybe()
 		}
-		// rl.options.ZapLogger.Debug("current count", zap.Any("count", curr))
+		// zl.Debug("current count", zap.Any("count", curr))
 
 		var prev int64
 		if intervals[1] == nil {
@@ -154,7 +172,7 @@ func (rl *RateLimiter) Allow(ctx context.Context) (ret bool) {
 		} else {
 			prev, err = strconv.ParseInt(intervals[1].(string), 10, 64)
 			if err != nil {
-				return !rl.options.FailClosed
+				return rl.failMaybe()
 			}
 		}
 		curIntAgo := now.Sub(curIntStart)
@@ -163,11 +181,15 @@ func (rl *RateLimiter) Allow(ctx context.Context) (ret bool) {
 		rawOfLastInt := int64(float64(prev) * percentOfLastInt)
 		rateEstimate := int64(rawOfLastInt) + curr
 		if rateEstimate >= rl.rate {
-			ret = false
+			// right now this is mitigating based on the portion of the window that has
+			// to pass for it to be possible to get an allow (unless my math is wrong).
+			// This causes a ridiculous number of hits to redis though
+			notUntil = time.Now().Add(time.Duration(rl.interval.Nanoseconds() / rl.rate))
+			rl.mitigate(ctx, notUntil)
 		} else {
-			ret = true
+			notUntil = time.Time{}
 		}
-		rl.options.ZapLogger.Debug("rate ok",
+		zl.Debug("rate check",
 			zap.Int64("prev", prev),
 			zap.Int64("curr", curr),
 			zap.Duration("curIntAgo", curIntAgo),
@@ -178,8 +200,12 @@ func (rl *RateLimiter) Allow(ctx context.Context) (ret bool) {
 		)
 		return
 	}
-	// rl.options.ZapLogger.Debug("no intervals, allowing", zap.String("key", rl.key))
-	return true
+	// zl.Debug("no intervals, allowing", zap.String("key", rl.key))
+	return time.Time{}
+}
+
+func (rl *RateLimiter) Allow(ctx context.Context) (ret bool) {
+	return time.Now().After(rl.AllowWithUntil(ctx))
 }
 
 func (rl *RateLimiter) Wait(ctx context.Context) {
@@ -188,38 +214,35 @@ WAIT:
 		return
 	}
 	until := rl.mitigatedUntil(ctx)
-
-	// Calculate logarithmic wait duration between current until and full interval
-	fullDuration := rl.interval
-	currentDuration := time.Until(until)
-	if currentDuration <= 0 {
-		currentDuration = time.Millisecond
+	if until.IsZero() {
+		return
 	}
 
-	// an LLM wrote this and I have no idea if it's actually a good distribution to use
-	logScale := math.Log(float64(fullDuration)) / math.Log(float64(currentDuration))
-	scaledDuration := time.Duration(float64(currentDuration) * logScale)
+	minDuration := rl.interval / time.Duration(rl.rate)
+	maxDuration := time.Until(until)
+	waitRange := max(maxDuration-minDuration, maxDuration)
+	randomOffset := time.Duration(float64(waitRange) * float64(rand.Float64()))
+	scaledDuration := minDuration + randomOffset
 
-	if scaledDuration > fullDuration {
-		scaledDuration = fullDuration
-	}
-
-	rl.options.ZapLogger.Debug("waiting",
+	zl.Debug("waiting",
 		zap.String("key", rl.key),
 		zap.Duration("for", scaledDuration),
+		zap.Duration("minDuration", minDuration),
+		zap.Duration("maxDuration", maxDuration),
+		zap.Duration("waitRange", waitRange),
 	)
 	time.Sleep(scaledDuration)
 	goto WAIT
 }
 
 func (rl *RateLimiter) mitigate(ctx context.Context, until time.Time) {
-	rl.options.ZapLogger.Debug("mitigating",
+	zl.Debug("mitigating",
 		zap.String("key", rl.key),
 		zap.Duration("for", time.Until(until)),
 	)
 	mitigationCache.Store(rl.key, until)
 	mitigatedCacheWrites.Add(1)
-	_, err := rl.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+	_, err := rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		mKey := fmt.Sprintf("{%s}.m", rl.key)
 		pipe.Set(ctx, mKey, until.UnixNano(), max(time.Until(until), time.Millisecond))
 		return nil
@@ -238,7 +261,7 @@ func (rl *RateLimiter) mitigatedUntil(ctx context.Context) (until time.Time) {
 	/*
 		defer func() {
 			if !until.IsZero() && time.Now().Before(until) {
-				rl.options.ZapLogger.Debug("mitigated",
+				zl.Debug("mitigated",
 					zap.String("key", rl.key),
 					zap.Duration("for", time.Until(until)))
 			}
@@ -249,7 +272,7 @@ func (rl *RateLimiter) mitigatedUntil(ctx context.Context) (until time.Time) {
 		return u.(time.Time)
 	}
 	mitigatedCacheMisses.Add(1)
-	v, err := rl.rdb.Get(ctx, fmt.Sprintf("{%s}.m", rl.key)).Result()
+	v, err := rdb.Get(ctx, fmt.Sprintf("{%s}.m", rl.key)).Result()
 	redisGets.Add(1)
 	if err != nil {
 		if err == redis.Nil {
@@ -273,7 +296,7 @@ func (rl *RateLimiter) mitigatedUntil(ctx context.Context) (until time.Time) {
 		return time.Time{}
 	}
 	mitigatedUntil := time.Unix(0, unixNanos)
-	if time.Now().Before(mitigatedUntil) {
+	if time.Until(mitigatedUntil) > 0 {
 		mitigationCache.Store(rl.key, mitigatedUntil)
 		mitigatedCacheWrites.Add(1)
 		return mitigatedUntil
