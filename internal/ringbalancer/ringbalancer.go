@@ -1,0 +1,132 @@
+package ringbalancer
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+)
+
+var ErrDone = errors.New("done")
+
+type entry struct {
+	C    chan struct{} // C is the channel that will receive ticks to allow an unblock
+	Done chan struct{}
+	b    *Balancer // b is the balancer this entry is subscribed to for access to the mutex
+}
+
+// Close closes the entry and removes it from the balancer
+func (re *entry) Close() {
+	re.b.mu.Lock()
+	defer re.b.mu.Unlock()
+
+	if len(re.b.entries) == 0 {
+		return
+	} else if len(re.b.entries) == 1 {
+		re.b.entries = []*entry{}
+	} else {
+		i := slices.Index(re.b.entries, re)
+		re.b.entries = slices.Delete(re.b.entries, i, i+1)
+	}
+
+	close(re.C)
+	select {
+	case re.Done <- struct{}{}:
+	default:
+	}
+	close(re.Done)
+	if re.b.i >= len(re.b.entries) {
+		re.b.i = 0
+	}
+}
+
+func (re *entry) Wait() error {
+	select {
+	case <-re.C:
+		return nil
+	case <-re.Done:
+		return ErrDone
+	}
+}
+
+type Balancer struct {
+	entries []*entry
+	i       int
+	mu      sync.Mutex
+}
+
+func New() *Balancer {
+	return &Balancer{}
+}
+
+func (rb *Balancer) String() string {
+	output := []string{}
+	output = append(output, "Balancer{")
+	for i, e := range rb.entries {
+		output = append(output, fmt.Sprintf("  Entry %d: %+v", i, e))
+	}
+	output = append(output, fmt.Sprintf("  i: %d", rb.i))
+	output = append(output, "}\n")
+	return strings.Join(output, "\n")
+}
+
+func (rb *Balancer) Subscribe() *entry {
+	entry := &entry{
+		C:    make(chan struct{}),
+		Done: make(chan struct{}),
+		b:    rb,
+	}
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.entries = append(rb.entries, entry)
+	return entry
+}
+
+func (rb *Balancer) Tick() error {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	retries := 0
+RETRY:
+	retry := false
+
+	if len(rb.entries) == 0 {
+		return errors.New("no subscribers")
+	}
+
+	select {
+	case rb.entries[rb.i].C <- struct{}{}:
+	default:
+		retry = true
+	}
+
+	rb.i++
+	if rb.i >= len(rb.entries) {
+		rb.i = 0
+	}
+
+	if retry {
+		retries++
+		if len(rb.entries) <= retries {
+			return fmt.Errorf("send failed, no listenersd")
+		}
+		goto RETRY
+	}
+	return nil
+}
+
+func (rb *Balancer) Close() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	for _, e := range rb.entries {
+		close(e.C)
+		select {
+		case e.Done <- struct{}{}:
+		default:
+		}
+		close(e.Done)
+	}
+	rb.entries = []*entry{}
+	rb.i = 0
+}
