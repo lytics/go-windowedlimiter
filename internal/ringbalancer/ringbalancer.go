@@ -11,16 +11,14 @@ import (
 var ErrDone = errors.New("done")
 
 type entry struct {
-	C    chan struct{} // C is the channel that will receive ticks to allow an unblock
-	Done chan struct{}
-	b    *Balancer // b is the balancer this entry is subscribed to for access to the mutex
+	C chan struct{} // C is the channel that will receive ticks to allow an unblock
+	b *Balancer     // b is the balancer this entry is subscribed to for access to the mutex
 }
 
 // Close closes the entry and removes it from the balancer
 func (re *entry) Close() {
 	re.b.mu.Lock()
 	defer re.b.mu.Unlock()
-
 	if len(re.b.entries) == 0 {
 		return
 	} else if len(re.b.entries) == 1 {
@@ -29,25 +27,18 @@ func (re *entry) Close() {
 		i := slices.Index(re.b.entries, re)
 		re.b.entries = slices.Delete(re.b.entries, i, i+1)
 	}
-
 	close(re.C)
-	select {
-	case re.Done <- struct{}{}:
-	default:
-	}
-	close(re.Done)
 	if re.b.i >= len(re.b.entries) {
 		re.b.i = 0
 	}
 }
 
 func (re *entry) Wait() error {
-	select {
-	case <-re.C:
-		return nil
-	case <-re.Done:
+	_, ok := <-re.C
+	if !ok {
 		return ErrDone
 	}
+	return nil
 }
 
 type Balancer struct {
@@ -73,9 +64,8 @@ func (rb *Balancer) String() string {
 
 func (rb *Balancer) Subscribe() *entry {
 	entry := &entry{
-		C:    make(chan struct{}),
-		Done: make(chan struct{}),
-		b:    rb,
+		C: make(chan struct{}),
+		b: rb,
 	}
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -121,11 +111,6 @@ func (rb *Balancer) Close() {
 	defer rb.mu.Unlock()
 	for _, e := range rb.entries {
 		close(e.C)
-		select {
-		case e.Done <- struct{}{}:
-		default:
-		}
-		close(e.Done)
 	}
 	rb.entries = []*entry{}
 	rb.i = 0
