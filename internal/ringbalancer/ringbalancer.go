@@ -10,19 +10,19 @@ import (
 
 var ErrDone = errors.New("done")
 
-type entry struct {
+type Entry struct {
 	C chan struct{} // C is the channel that will receive ticks to allow an unblock
 	b *Balancer     // b is the balancer this entry is subscribed to for access to the mutex
 }
 
 // Close closes the entry and removes it from the balancer
-func (re *entry) Close() {
+func (re *Entry) Close() {
 	re.b.mu.Lock()
 	defer re.b.mu.Unlock()
 	if len(re.b.entries) == 0 {
 		return
 	} else if len(re.b.entries) == 1 {
-		re.b.entries = []*entry{}
+		re.b.entries = []*Entry{}
 	} else {
 		i := slices.Index(re.b.entries, re)
 		re.b.entries = slices.Delete(re.b.entries, i, i+1)
@@ -35,7 +35,7 @@ func (re *entry) Close() {
 
 // Wait blocks until this subscriber receives a tick, or the entry is closed
 // returns ErrDone if the entry is closed
-func (re *entry) Wait() error {
+func (re *Entry) Wait() error {
 	_, ok := <-re.C
 	if !ok {
 		return ErrDone
@@ -45,7 +45,7 @@ func (re *entry) Wait() error {
 
 // Balancer is a ring balancer that distributes ticks to subscribers in a round-robin fashion
 type Balancer struct {
-	entries []*entry
+	entries []*Entry
 	i       int
 	mu      sync.Mutex
 }
@@ -68,8 +68,8 @@ func (rb *Balancer) String() string {
 }
 
 // Subscribe creates a new subscriber entry
-func (rb *Balancer) Subscribe() *entry {
-	entry := &entry{
+func (rb *Balancer) Subscribe() *Entry {
+	entry := &Entry{
 		C: make(chan struct{}),
 		b: rb,
 	}
@@ -121,6 +121,6 @@ func (rb *Balancer) Close() {
 	for _, e := range rb.entries {
 		close(e.C)
 	}
-	rb.entries = []*entry{}
+	rb.entries = []*Entry{}
 	rb.i = 0
 }
