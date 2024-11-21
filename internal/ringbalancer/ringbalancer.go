@@ -19,15 +19,13 @@ type Entry struct {
 func (re *Entry) Close() {
 	re.b.mu.Lock()
 	defer re.b.mu.Unlock()
+
 	if len(re.b.entries) == 0 {
-		return
-	} else if len(re.b.entries) == 1 {
-		re.b.entries = []*Entry{}
 	} else {
 		i := slices.Index(re.b.entries, re)
 		re.b.entries = slices.Delete(re.b.entries, i, i+1)
 	}
-	close(re.C)
+	// close(re.C)
 	if re.b.i >= len(re.b.entries) {
 		re.b.i = 0
 	}
@@ -65,6 +63,12 @@ func (rb *Balancer) String() string {
 	output = append(output, fmt.Sprintf("  i: %d", rb.i))
 	output = append(output, "}\n")
 	return strings.Join(output, "\n")
+}
+
+func (rb *Balancer) Subscribers() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return len(rb.entries)
 }
 
 // Subscribe creates a new subscriber entry
