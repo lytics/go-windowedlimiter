@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vitaminmoo/go-slidingwindow/internal/mitigation"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -83,7 +84,6 @@ func TestRateLimiterConcurrent(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
-		// labels := pprof.Labels("name", "waiter", "number", fmt.Sprintf("%d", i))
 		labels := pprof.Labels("name", "testWaiter")
 		go pprof.Do(ctx, labels, func(context.Context) {
 			defer wg.Done()
@@ -105,12 +105,12 @@ func TestRateLimiterConcurrent(t *testing.T) {
 	time.Sleep(interval * 3)
 	require.True(t, mitigation.Allow(ctx, key), "should not be mitigated")
 
-	analyzeIntervals(t, interval, granularity, rate, intervals)
+	analyzeIntervals(t, l.logger, interval, granularity, rate, intervals)
 
 	total := len(durations)
 	assert.NotZero(t, total, "didn't record any requests")
 
-	t.Logf("total sent: %d", len(durations))
+	l.logger.Sugar().Infof("total sent: %d", len(durations))
 }
 
 func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
@@ -142,8 +142,9 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 	return l, key
 }
 
-func analyzeIntervals(t *testing.T, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
+func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
 	t.Helper()
+	logger = logger.WithOptions(zap.AddCallerSkip(1))
 	var minInterval time.Time
 	var maxInterval time.Time
 	for s := range intervals {
@@ -155,7 +156,7 @@ func analyzeIntervals(t *testing.T, _ time.Duration, granularity time.Duration, 
 		}
 	}
 	for i := minInterval; i.Before(maxInterval); i = i.Add(granularity) {
-		t.Logf("requests in interval %v: %d", i.Format("05.000"), intervals[i])
+		logger.Sugar().Infof("requests in interval %v: %d", i.Format("05.000"), intervals[i])
 	}
 	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularity*0)], rate, "first interval should have at least rate requests")
 	assert.Equal(t, intervals[minInterval.Add(granularity*1)], int64(0), "second interval should have zero requests")

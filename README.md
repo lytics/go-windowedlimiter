@@ -12,14 +12,11 @@ Currently extremely pre-alpha. The API is guaranteed to change, as are the inter
 - [ ] Comprehensive testing/benchmarking suite to verify not only that the limiter is basically working, but also that it is doing what it's supposed to on a fine time granularity, in a relatively distributed use-case
 - [ ] Explicitly tested for correctness and performance
   - [ ] Low volume (cpu usage/latency of a single request)
-    - Default to asynchronous increments
-    - Support synchronous for hard-capped usecases
   - [ ] High volume (max_rate-1)
-    - [ ] Support batching increments if we're in async mode?
   - [ ] Max volume (max_rate)
     - [x] Use a mitigation cache to efficiently block requests
-    - [ ] Use a single goroutine to control the mitigation cache per-process
-    - [ ] Load balance the allowed rate across all waiting threads
+    - [x] Use a single goroutine to control the mitigation cache per-process
+    - [x] Load balance the allowed rate across all waiting threads
     - [ ] Have the mitigation cache coordinate cross-process such that all processes/threads only try at the allowed rate
 - [x] Configurable open or closed failure modes (default to open)
 
