@@ -2,6 +2,7 @@ package slidingwindow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/pprof"
 	"strconv"
@@ -13,86 +14,118 @@ import (
 	"go.uber.org/zap"
 )
 
-var zl zap.Logger
+type Options struct {
+	Logger     *zap.Logger
+	KeyConfFn  func(ctx context.Context, key string) *KeyConf
+	FailClosed bool
+	SyncIncr   bool
+}
 
-var incrChan = make(chan *RateLimiter, 1)
+type KeyConf struct {
+	rate      int64
+	interval  time.Duration
+	firstUsed time.Time
+	lastUsed  time.Time
+}
 
-func incrementer(wg *sync.WaitGroup, ctx context.Context) {
-	defer wg.Done()
+func New(ctx context.Context, rdb redis.Cmdable, options ...*Options) *Limiter {
+	l := &Limiter{
+		logger: zap.NewNop(),
+		rdb:    rdb,
+		// TODO: expire keyConfCache entries
+		keyConfCache: make(map[string]*KeyConf),
+		keyConfFn:    func(ctx context.Context, key string) *KeyConf { return &KeyConf{rate: 100, interval: time.Second} },
+		incrChan:     make(chan string),
+		doneChan:     make(chan struct{}),
+		failClosed:   false,
+		syncIncr:     false,
+	}
+	if len(options) > 0 {
+		l.logger = options[0].Logger
+		l.keyConfFn = options[0].KeyConfFn
+		l.failClosed = options[0].FailClosed
+		l.syncIncr = options[0].SyncIncr
+	}
+	l.wg.Add(1)
+	go pprof.Do(ctx, pprof.Labels("name", "slidingwindow_incrementer"), func(ctx context.Context) { l.incrementer(ctx) })
+	return l
+}
+
+type Limiter struct {
+	logger       *zap.Logger
+	rdb          redis.Cmdable
+	keyConfCache map[string]*KeyConf
+	keyConfFn    func(ctx context.Context, key string) *KeyConf
+	incrChan     chan string
+	doneChan     chan struct{}
+	wg           sync.WaitGroup
+	failClosed   bool
+	syncIncr     bool
+}
+
+func (l *Limiter) Close() {
+	l.doneChan <- struct{}{}
+	l.logger.Sync()
+	l.wg.Wait()
+}
+
+func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
+	keyConf, ok := l.keyConfCache[key]
+	if !ok {
+		keyConf = l.keyConfFn(ctx, key)
+		l.keyConfCache[key] = keyConf
+	}
+	return keyConf
+}
+
+func (l *Limiter) incrementer(ctx context.Context) {
+	defer l.wg.Done()
 	for {
 		select {
-		case <-ctx.Done():
-			zl.Debug("incrementer stopping")
+		case <-l.doneChan:
+			l.logger.Debug("incrementer stopping via Close()")
 			return
-		case rl := <-incrChan:
-			curIntStart := time.Now().Truncate(rl.interval)
-			curKey := fmt.Sprintf("{%s}.%d", rl.key, curIntStart.UnixNano())
-			res, err := rl.rdb.Incr(context.Background(), curKey).Result()
-			if err != nil {
-				zl.Error("error incrementing key", zap.String("key", curKey), zap.Error(err))
+		case <-ctx.Done():
+			l.logger.Debug("incrementer stopping via context cancellation")
+			return
+		case key := <-l.incrChan:
+			keyConf := l.keyConf(ctx, key)
+			curIntStart := time.Now().Truncate(keyConf.interval)
+			curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
+			res, err := l.rdb.Incr(context.Background(), curKey).Result()
+			if err != nil && !errors.Is(err, redis.ErrClosed) {
+				l.logger.Error("error incrementing key", zap.String("key", curKey), zap.Error(err))
 			}
 			if err == nil && res == 1 {
-				rl.rdb.ExpireNX(context.Background(), rl.key, max(3*rl.interval, time.Second))
+				l.rdb.ExpireNX(context.Background(), key, max(3*keyConf.interval, time.Second))
 			}
-			if res >= rl.rate {
-				zl.Debug("mitigating due to current window being full in incrementer", zap.String("key", rl.key), zap.Int64("rate", rl.rate), zap.Duration("interval", rl.interval), zap.Int64("res", res))
-				rl.mitigate(ctx)
+			if res >= keyConf.rate {
+				l.logger.Debug("mitigating due to current window being full in incrementer",
+					zap.String("key", key),
+					zap.Int64("rate", keyConf.rate),
+					zap.Duration("interval", keyConf.interval),
+					zap.Int64("res", res),
+				)
+				l.mitigate(ctx, key)
 			}
 		}
 	}
 }
 
-func Init(ctx context.Context, z zap.Logger) func() {
-	ctx, cancel := context.WithCancel(ctx)
-	zl = z
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go pprof.Do(ctx, pprof.Labels("name", "incrementer"), func(ctx context.Context) { incrementer(wg, ctx) })
-	return func() {
-		cancel()
-		wg.Wait()
-	}
-}
-
-type Options struct {
-	FailOpen bool
-}
-
-type RateLimiter struct {
-	rdb      redis.Cmdable
-	key      string
-	rate     int64
-	interval time.Duration
-	options  Options
-}
-
-func NewRateLimiter(rdb redis.Cmdable, key string, rate int64, interval time.Duration, opt ...Options) *RateLimiter {
-	var options Options
-	if len(opt) > 0 {
-		options = opt[0]
-	}
-	return &RateLimiter{
-		rdb:      rdb,
-		key:      key,
-		rate:     rate,
-		interval: interval,
-		options:  options,
-	}
-}
-
-func (rl *RateLimiter) checkRedis(ctx context.Context) (bool, error) {
+func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 	now := time.Now()
-	curIntStart := now.Truncate(rl.interval)
-	prevIntStart := curIntStart.Add(-rl.interval)
-	intervals, redisErr := rl.rdb.MGet(ctx,
-		fmt.Sprintf("{%s}.%d", rl.key, curIntStart.UnixNano()),
-		fmt.Sprintf("{%s}.%d", rl.key, prevIntStart.UnixNano()),
+	keyConf := l.keyConf(ctx, key)
+	curIntStart := now.Truncate(keyConf.interval)
+	prevIntStart := curIntStart.Add(-keyConf.interval)
+	intervals, err := l.rdb.MGet(ctx,
+		fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano()),
+		fmt.Sprintf("{%s}.%d", key, prevIntStart.UnixNano()),
 	).Result()
-	if redisErr != nil {
+	if err != nil {
 		// we failed talking to redis here so we do /not/ try to do any other commands
 		// to it, especially not trying to write to a node that can't even do a read
-		zl.Error("getting intervals", zap.Error(redisErr))
-		return false, redisErr
+		l.logger.Error("getting intervals", zap.Error(err))
+		return false, err
 	}
 
 	if intervals[0] != nil {
@@ -110,79 +143,83 @@ func (rl *RateLimiter) checkRedis(ctx context.Context) (bool, error) {
 			}
 		}
 		curIntAgo := now.Sub(curIntStart)
-		portionOfLastInt := rl.interval - curIntAgo
-		percentOfLastInt := float64(portionOfLastInt.Nanoseconds()) / float64(rl.interval.Nanoseconds())
+		portionOfLastInt := keyConf.interval - curIntAgo
+		percentOfLastInt := float64(portionOfLastInt.Nanoseconds()) / float64(keyConf.interval.Nanoseconds())
 		rawOfLastInt := int64(float64(prev) * percentOfLastInt)
 		rateEstimate := int64(rawOfLastInt) + curr
-		if rateEstimate >= rl.rate {
+		if rateEstimate >= keyConf.rate {
 			return false, nil
 		}
 	}
 	return true, nil
 }
 
-func (rl *RateLimiter) mitigate(ctx context.Context) {
-	period := time.Duration(rl.interval.Nanoseconds() / rl.rate)
+func (l *Limiter) mitigate(ctx context.Context, key string) {
+	keyConf := l.keyConf(ctx, key)
+	period := time.Duration(keyConf.interval.Nanoseconds() / keyConf.rate)
 	allow := func(ctx context.Context) bool {
-		allowed, err := rl.checkRedis(ctx)
+		allowed, err := l.checkRedis(ctx, key)
 		if err != nil {
-			allowed = allowed || !rl.options.FailOpen
-			zl.Debug("mitigation check (err)", zap.String("key", rl.key), zap.Bool("allowed", allowed))
+			allowed = allowed || l.failClosed
 			return allowed
 		}
-		zl.Debug("mitigation check", zap.String("key", rl.key), zap.Bool("allowed", allowed))
 		return allowed
 	}
-	zl.Debug("mitigating", zap.String("key", rl.key), zap.Duration("period", period))
-	mitigation.Trigger(ctx, rl.key, period, allow)
+	l.logger.Debug("mitigating", zap.String("key", key), zap.Duration("period", period))
+	mitigation.Trigger(ctx, key, period, allow)
 }
 
-func (rl *RateLimiter) Allow(ctx context.Context) (allowed bool) {
-	pprof.Do(ctx, pprof.Labels("key", rl.key), func(ctx context.Context) {
-		allowed = rl.allow(ctx)
+func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool) {
+	pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
+		allowed = l.allow(ctx, key)
 	})
 	return
 }
 
-func (rl *RateLimiter) allow(ctx context.Context) (allowed bool) {
-	zl := zl.With(zap.String("key", rl.key))
+func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
+	logger := l.logger.With(zap.String("key", key))
 	var err error
 	defer func() {
 		if err != nil {
-			zl.Error("checking redis", zap.Error(err))
+			l.logger.Error("checking redis", zap.Error(err))
 		} else {
 			if allowed {
 				// only increment if we didn't fail talking to redis
-				incrChan <- rl
+				l.incrChan <- key
 			}
 		}
 	}()
-	if mitigation.Allow(ctx, rl.key) {
-		zl.Debug("allowed by mitigation")
+	if mitigation.Allow(ctx, key) {
+		l.logger.Debug("allowed by mitigation")
 		return true
 	}
-	allowed, err = rl.checkRedis(ctx)
-	zl.Debug("checked by redis", zap.Bool("allowed", allowed), zap.Error(err))
+	allowed, err = l.checkRedis(ctx, key)
+	logger.Debug("checked by redis", zap.Bool("allowed", allowed), zap.Error(err))
 	if err != nil {
-		return allowed || !rl.options.FailOpen
+		return allowed || l.failClosed
 	}
 	return allowed
 }
 
-func (rl *RateLimiter) Wait(ctx context.Context) {
-	pprof.Do(ctx, pprof.Labels("key", rl.key), func(ctx context.Context) {
-		rl.wait(ctx)
+func (l *Limiter) Wait(ctx context.Context, key string) {
+	pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
+		l.wait(ctx, key)
 	})
 }
 
-func (rl *RateLimiter) wait(ctx context.Context) {
-	now := time.Now()
+func (l *Limiter) wait(ctx context.Context, key string) {
+	logger := l.logger.With(zap.String("key", key))
+	// now := time.Now()
+	retries := 0
 RETRY: // TODO: exponential backoff?
-	err := mitigation.Wait(ctx, rl.key)
+	err := mitigation.Wait(ctx, key)
 	if err != nil {
-		zl.Error("waiting", zap.Error(err))
+		l.logger.Error("waiting", zap.Error(err))
+		retries++
 		goto RETRY
 	}
-	incrChan <- rl
-	zl.Debug("wait woke up", zap.String("key", rl.key), zap.Duration("wait", time.Since(now)))
+	l.incrChan <- key
+	if retries > 0 {
+		logger.Warn("waiter retried", zap.Int("count", retries))
+	}
 }

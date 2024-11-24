@@ -10,6 +10,7 @@ import (
 )
 
 var (
+	// This cache is in a package global as keys are global - like the external redis server
 	mitigationCache = sync.Map{}
 	ttlMultiplier   = time.Duration(3)
 )

@@ -8,39 +8,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fgrosse/zaptest"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vitaminmoo/go-slidingwindow/internal/mitigation"
-	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestRateLimiterBasic(t *testing.T) {
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-
-	zl, err := zap.NewDevelopment()
-	require.NoError(t, err)
-	zl = zap.NewNop()
-
-	cleanup := Init(ctx, *zl)
-	defer cleanup()
-	defer rdb.Close()
-
-	key := fmt.Sprintf("%d", time.Now().UnixNano())
 	rate := int64(10)
 	interval := 100 * time.Millisecond
-	limiter := NewRateLimiter(rdb, key, rate, interval)
-
-	// avoid testing over the first interval wrap, which can cause more requests to
-	// be allowed
-	time.Sleep(time.Until(time.Now().Truncate(interval).Add(interval)))
+	l, key := setup(t, ctx, rate, interval)
 
 	allowed := 0
 	for i := 0; i < 15; i++ {
-		if limiter.Allow(ctx) {
+		if l.Allow(ctx, key) {
 			time.Sleep(2 * time.Millisecond) // due to async incrementer
 			allowed++
 		}
@@ -48,62 +32,29 @@ func TestRateLimiterBasic(t *testing.T) {
 	assert.Equal(t, 10, allowed)
 
 	now := time.Now()
-	limiter.Wait(ctx)
+	l.Wait(ctx, key)
 	assert.WithinDuration(t, time.Now(), now, interval)
 
 	for i := 0; i < 10; i++ {
 		now := time.Now()
-		limiter.Wait(ctx)
+		l.Wait(ctx, key)
 		assert.WithinDuration(t, time.Now(), now, 11*time.Millisecond)
 	}
 }
 
-func analyzeIntervals(t *testing.T, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
-	t.Helper()
-	var minInterval time.Time
-	var maxInterval time.Time
-	for s := range intervals {
-		if minInterval.IsZero() || s.Before(minInterval) {
-			minInterval = s
-		}
-		if maxInterval.IsZero() || s.After(maxInterval) {
-			maxInterval = s
-		}
-	}
-	for i := minInterval; i.Before(maxInterval); i = i.Add(granularity) {
-		t.Logf("requests in interval %v: %d", i.Format("05.000"), intervals[i])
-	}
-	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularity*0)], rate, "first interval should have at least rate requests")
-	assert.Equal(t, intervals[minInterval.Add(granularity*1)], int64(0), "second interval should have zero requests")
-}
-
 func TestRateLimiterConcurrent(t *testing.T) {
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
-	zl, err := zap.NewDevelopment()
-	require.NoError(t, err)
-	zl = zap.NewNop()
-
-	cleanup := Init(ctx, *zl)
-	defer cleanup()
-	defer rdb.Close()
-
-	key := fmt.Sprintf("%d", time.Now().UnixNano())
-	interval := 500 * time.Millisecond
-	granularity := 250 * time.Millisecond
 	rate := int64(100)
-	limiter := NewRateLimiter(rdb, key, rate, interval)
+	interval := 500 * time.Millisecond
+	l, key := setup(t, ctx, rate, interval)
+	granularity := time.Duration(interval.Nanoseconds() / 4)
 
 	var wg sync.WaitGroup
-
 	var durations []time.Duration
 	timesChan := make(chan time.Time, 10000)
 	durationsChan := make(chan time.Duration, 10000)
 	intervals := make(map[time.Time]int64)
 	done := make(chan struct{})
-
 	var collectorWg sync.WaitGroup
 	collectorWg.Add(1)
 	go pprof.Do(ctx, pprof.Labels("name", "collectorWg"), func(context.Context) {
@@ -130,10 +81,6 @@ func TestRateLimiterConcurrent(t *testing.T) {
 		}
 	})
 
-	// avoid testing over the first interval wrap, which can cause more requests to
-	// be allowed
-	time.Sleep(time.Until(time.Now().Truncate(interval).Add(interval)))
-
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		// labels := pprof.Labels("name", "waiter", "number", fmt.Sprintf("%d", i))
@@ -142,7 +89,7 @@ func TestRateLimiterConcurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; int64(j) < rate; j++ {
 				now := time.Now()
-				limiter.Wait(ctx)
+				l.Wait(ctx, key)
 				timesChan <- time.Now()
 				durationsChan <- time.Since(now)
 				time.Sleep(1 * time.Millisecond)
@@ -164,4 +111,52 @@ func TestRateLimiterConcurrent(t *testing.T) {
 	assert.NotZero(t, total, "didn't record any requests")
 
 	t.Logf("total sent: %d", len(durations))
+}
+
+func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
+	t.Helper()
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	config := zaptest.Config()
+	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	zaptest.Config = func() zapcore.EncoderConfig { return config }
+	logger := zaptest.Logger(t)
+
+	key := fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()%1000)
+	keyConfFn := func(ctx context.Context, key string) *KeyConf {
+		return &KeyConf{rate: rate, interval: interval}
+	}
+	l := New(ctx, rdb, &Options{
+		Logger:    logger,
+		KeyConfFn: keyConfFn,
+	})
+	t.Cleanup(func() {
+		l.Close()
+		rdb.Close()
+	})
+	// avoid testing over the first interval wrap, which can cause more requests to
+	// be allowed
+	time.Sleep(time.Until(time.Now().Truncate(interval).Add(interval)))
+	return l, key
+}
+
+func analyzeIntervals(t *testing.T, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
+	t.Helper()
+	var minInterval time.Time
+	var maxInterval time.Time
+	for s := range intervals {
+		if minInterval.IsZero() || s.Before(minInterval) {
+			minInterval = s
+		}
+		if maxInterval.IsZero() || s.After(maxInterval) {
+			maxInterval = s
+		}
+	}
+	for i := minInterval; i.Before(maxInterval); i = i.Add(granularity) {
+		t.Logf("requests in interval %v: %d", i.Format("05.000"), intervals[i])
+	}
+	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularity*0)], rate, "first interval should have at least rate requests")
+	assert.Equal(t, intervals[minInterval.Add(granularity*1)], int64(0), "second interval should have zero requests")
 }
