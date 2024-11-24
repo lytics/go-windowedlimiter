@@ -100,11 +100,6 @@ func (l *Limiter) increment(ctx context.Context, key string) {
 		l.rdb.ExpireNX(context.Background(), key, max(3*keyConf.interval, time.Second))
 	}
 	if res >= keyConf.rate {
-		logger.Debug("mitigating due to current window being full in incrementer",
-			zap.Int64("rate", keyConf.rate),
-			zap.Duration("interval", keyConf.interval),
-			zap.Int64("res", res),
-		)
 		l.mitigate(ctx, key)
 	}
 }
