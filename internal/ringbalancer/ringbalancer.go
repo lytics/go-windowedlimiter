@@ -19,12 +19,11 @@ type Entry struct {
 func (re *Entry) Close() {
 	re.b.mu.Lock()
 	defer re.b.mu.Unlock()
-
-	if len(re.b.entries) == 0 {
-	} else {
+	if len(re.b.entries) > 0 {
 		i := slices.Index(re.b.entries, re)
 		re.b.entries = slices.Delete(re.b.entries, i, i+1)
 	}
+	// we don't need to close as the GC will get it, and we won't panic if we don't even try
 	// close(re.C)
 	if re.b.i >= len(re.b.entries) {
 		re.b.i = 0
@@ -53,6 +52,17 @@ func New() *Balancer {
 	return &Balancer{}
 }
 
+// Close closes all subscribers and removes them from the balancer
+func (rb *Balancer) Close() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	for _, e := range rb.entries {
+		close(e.C)
+	}
+	rb.entries = []*Entry{}
+	rb.i = 0
+}
+
 // String returns a string representation of the balancer for debugging
 func (rb *Balancer) String() string {
 	output := []string{}
@@ -65,6 +75,7 @@ func (rb *Balancer) String() string {
 	return strings.Join(output, "\n")
 }
 
+// Subscribers returns the number of subscribers currently registered
 func (rb *Balancer) Subscribers() int {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -116,15 +127,4 @@ RETRY:
 		goto RETRY
 	}
 	return nil
-}
-
-// Close closes all subscribers and removes them from the balancer
-func (rb *Balancer) Close() {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	for _, e := range rb.entries {
-		close(e.C)
-	}
-	rb.entries = []*Entry{}
-	rb.i = 0
 }

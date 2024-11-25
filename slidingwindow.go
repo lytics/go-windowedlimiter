@@ -16,9 +16,9 @@ import (
 )
 
 type Options struct {
-	Logger     *zap.Logger
-	KeyConfFn  func(ctx context.Context, key string) *KeyConf
-	FailClosed bool
+	Logger     *zap.Logger                                    // The zap logger to use for logging. Will default to not logging anything
+	KeyConfFn  func(ctx context.Context, key string) *KeyConf // A function that returns the KeyConf for a given key. This will be called lazily, once per key, until `Limiter.Refresh()` or `Limiter.RefreshKey(key string)` is called
+	FailClosed bool                                           // Whether or not to deny requests/block if the limiter is unable to determine if a request should be allowed. Note that due to the mitigation cache, this currently only has any effect when a key is already in the mitigation cache
 }
 
 type KeyConf struct {
@@ -28,6 +28,7 @@ type KeyConf struct {
 	lastUsed  time.Time
 }
 
+// New creates a new Limiter with the provided redis client and options
 func New(ctx context.Context, rdb redis.Cmdable, options ...*Options) *Limiter {
 	l := &Limiter{
 		logger: zap.NewNop(),
@@ -68,11 +69,13 @@ func (l *Limiter) Close() {
 }
 
 // Refresh causes the KeyConfFn to be called again for all keys (lazily)
+// If your rate limit is changing globally, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) Refresh(ctx context.Context) {
 	l.keyConfCache.Clear()
 }
 
 // RefreshKey causes the KeyConfFn to be called again for the specified key (lazily)
+// If your rate limit is changing for a specific key, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) RefreshKey(ctx context.Context, key string) {
 	l.keyConfCache.Delete(key)
 }

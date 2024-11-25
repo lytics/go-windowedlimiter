@@ -1,3 +1,10 @@
+// Package mitigation provides a way to fast-path allows for keys that are not actively hitting their rate limit.
+//
+// While a key is not mitigated, `Allow()` and `Wait()` will only do a `sync.Map` lookup and then return immediately.
+//
+// While a key is mitigated, a single goroutine will be responsible for checking the allowFn and distributing the the allowed requests to all callers evenly.
+//
+// Keys are currently stored globally
 package mitigation
 
 import (
@@ -15,7 +22,7 @@ var (
 	ttlMultiplier   = time.Duration(3)
 )
 
-// a mitigation exists to allow caching of a mitigated state, and cooperative
+// mitigation exists to allow caching of a mitigated state, and cooperative
 // sharing of requests as the mitigation expires and is refreshed
 type mitigation struct {
 	period  time.Duration              // the period we should retry the allow function at
@@ -27,13 +34,15 @@ type mitigation struct {
 	mu      sync.Mutex                 // mutex for the mitigation
 }
 
-// Trigger creates a new mitigation
-// args:
+// Trigger creates a new mitigation or refreshes an existing one's ttl
 //
-// ctx: context specifically for cancellation of the mitigation garbage collector goroutine
-// key: the key to store the mitigation under
-// period: the time between attempts to do a request
-// allowFn: a function to call that will be the gatekeeper for requests, after mitigate does its own adjustment on how frequently to try
+// ctx is specifically for cancellation of the mitigation's garbage collector goroutine, which happens automatically if the mitigation expires.
+//
+// key is the key to mitigate. Note that all keys are global
+//
+// period is how often to retry the allowFn, which will be the maximum rate requests are allowed
+//
+// allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive.
 func Trigger(ctx context.Context, key string, period time.Duration, allowFn func(context.Context) bool) {
 	mit, ok := mitigationCache.Load(key)
 	if ok {
@@ -83,9 +92,9 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 	})
 }
 
-// Wait blocks until the mitigation fires, is cancelled via context, or is done
-// Note that currently, Wait() unsubscribe/resubscribes to the ringbuffer every
-// time it's called which is pretty non-ideal
+// Wait blocks until the mitigation fires, is cancelled via context, or is done.
+//
+// Note that currently, Wait() unsubscribe/resubscribes to the ringbuffer every time it's called which is pretty non-ideal.
 func Wait(ctx context.Context, key string) error {
 	value, ok := mitigationCache.Load(key)
 	if !ok {
@@ -111,10 +120,9 @@ func Wait(ctx context.Context, key string) error {
 	}
 }
 
-// Allow returns true if one request is allowed
-// Note that Allow will not even try to do requests while a mitigation is
-// active, so it will likely never succeed if goroutines are calling Wait() with
-// the same key
+// Allow reports whether a request is allowed for the given key.
+//
+// Note that Allow will not even try to do requests while a mitigation is active, so it will likely never succeed if goroutines are calling Wait() with the same key
 func Allow(ctx context.Context, key string) bool {
 	mit, ok := mitigationCache.Load(key)
 	if !ok {
