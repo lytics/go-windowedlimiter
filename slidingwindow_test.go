@@ -17,7 +17,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-func TestRateLimiterBasic(t *testing.T) {
+func TestBasic(t *testing.T) {
 	ctx := context.Background()
 	rate := int64(10)
 	interval := 100 * time.Millisecond
@@ -43,7 +43,25 @@ func TestRateLimiterBasic(t *testing.T) {
 	}
 }
 
-func TestRateLimiterConcurrent(t *testing.T) {
+func TestFailureMode(t *testing.T) {
+	ctx := context.Background()
+	rate := int64(1)
+	interval := 1 * time.Second
+	l, key := setup(t, ctx, rate, interval)
+
+	assert.True(t, l.Allow(ctx, key), "first request should be allowed")
+	time.Sleep(50 * time.Millisecond)
+
+	// kill redis in a way that fails instantly
+	l.rdb = redis.NewClient(&redis.Options{
+		Addr: "127.0.0.1:0",
+	})
+	assert.True(t, l.Allow(ctx, key), "should be allowed with redis down")
+	l.failClosed = true
+	assert.False(t, l.Allow(ctx, key), "should be denied with redis down")
+}
+
+func TestConcurrent(t *testing.T) {
 	ctx := context.Background()
 	rate := int64(100)
 	interval := 500 * time.Millisecond

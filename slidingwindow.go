@@ -172,8 +172,8 @@ func (l *Limiter) mitigate(ctx context.Context, key string) {
 	allow := func(ctx context.Context) bool {
 		allowed, err := l.checkRedis(ctx, key)
 		if err != nil {
-			allowed = allowed || l.failClosed
-			return allowed
+			logger.Debug("failed to check redis for mitigation status", zap.Error(err))
+			return !l.failClosed
 		}
 		return allowed
 	}
@@ -209,7 +209,8 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 	allowed, err = l.checkRedis(ctx, key)
 	logger.Debug("checked by redis", zap.Bool("allowed", allowed), zap.Error(err))
 	if err != nil {
-		return allowed || l.failClosed
+		logger.Debug("failed to check redis for rate", zap.Error(err))
+		return !l.failClosed
 	}
 	return allowed
 }
