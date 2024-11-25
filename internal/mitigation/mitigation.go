@@ -42,7 +42,7 @@ type mitigation struct {
 //
 // period is how often to retry the allowFn, which will be the maximum rate requests are allowed
 //
-// allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive.
+// allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive. allowFn must be thread safe.
 func Trigger(ctx context.Context, key string, period time.Duration, allowFn func(context.Context) bool) {
 	mit, ok := mitigationCache.Load(key)
 	if ok {
@@ -86,6 +86,12 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 						m.until = time.Now().Add(m.period)
 					}
 				}
+				if m.rb.Subscribers() > 0 {
+					// there are still subscribers, extend the mitigation
+					// this is kinda incompatible with moving from Wait() to something
+					// more stateful
+					m.ttl = time.Now().Add(ttlMultiplier * m.period)
+				}
 				m.mu.Unlock()
 			}
 		}
@@ -108,29 +114,27 @@ func Wait(ctx context.Context, key string) error {
 		return ctx.Err()
 	case <-entry.C:
 		entry.Close()
-		if m.rb.Subscribers() > 0 {
-			// there are still subscribers, extend the mitigation
-			// this is kinda incompatible with moving from Wait() to something
-			// more stateful
-			m.mu.Lock()
-			m.ttl = time.Now().Add(3 * m.period)
-			m.mu.Unlock()
-		}
 		return nil
 	}
 }
 
 // Allow reports whether a request is allowed for the given key.
 //
-// Note that Allow will not even try to do requests while a mitigation is active, so it will likely never succeed if goroutines are calling Wait() with the same key
+// Note that Allow will call allowFn
 func Allow(ctx context.Context, key string) bool {
+	var allowed bool
+	var m *mitigation
 	mit, ok := mitigationCache.Load(key)
 	if !ok {
+		// we're not actually mitigated, allow immediately
 		return true
 	}
-	m := mit.(*mitigation)
-	if m.allowFn(ctx) {
-		return time.Now().After(m.until)
+	m = mit.(*mitigation)
+	if time.Now().After(m.until) {
+		allowed = m.allowFn(ctx)
+	}
+	if allowed {
+		return true
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

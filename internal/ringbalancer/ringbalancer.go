@@ -8,11 +8,12 @@ import (
 	"sync"
 )
 
+// ErrDone to any active subscriber(s) when the Entry or Balancer is closed
 var ErrDone = errors.New("done")
 
 type Entry struct {
 	C chan struct{} // C is the channel that will receive ticks to allow an unblock
-	b *Balancer     // b is the balancer this entry is subscribed to for access to the mutex
+	b *Balancer     // b is the balancer this entry is subscribed to (for access to the mutex)
 }
 
 // Close closes the entry and removes it from the balancer
@@ -42,8 +43,8 @@ func (re *Entry) Wait() error {
 
 // Balancer is a ring balancer that distributes ticks to subscribers in a round-robin fashion
 type Balancer struct {
-	entries []*Entry
-	i       int
+	entries []*Entry // entries is the list of subscribers
+	i       int      // i is the current index in the ring
 	mu      sync.Mutex
 }
 

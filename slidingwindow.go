@@ -15,34 +15,36 @@ import (
 	"go.uber.org/zap"
 )
 
-type Options struct {
-	Logger     *zap.Logger                                    // The zap logger to use for logging. Will default to not logging anything
-	KeyConfFn  func(ctx context.Context, key string) *KeyConf // A function that returns the KeyConf for a given key. This will be called lazily, once per key, until `Limiter.Refresh()` or `Limiter.RefreshKey(key string)` is called
-	FailClosed bool                                           // Whether or not to deny requests/block if the limiter is unable to determine if a request should be allowed. Note that due to the mitigation cache, this currently only has any effect when a key is already in the mitigation cache
-}
-
+// KeyConf is a configuration for a key. It's set lazily per-key by calling Options.KeyConfFn
 type KeyConf struct {
-	rate      int64
-	interval  time.Duration
-	firstUsed time.Time
-	lastUsed  time.Time
+	Rate     int64
+	Interval time.Duration
 }
 
-// New creates a new Limiter with the provided redis client and options
-func New(ctx context.Context, rdb redis.Cmdable, options ...*Options) *Limiter {
+// Options is a set of options for creating a new Limiter
+type Options struct {
+	Logger     *zap.Logger // The zap logger to use for logging. Will default to not logging anything
+	FailClosed bool        // Whether or not to deny requests/block if the limiter is unable to determine if a request should be allowed. Note that due to the mitigation cache, this currently only has any effect when a key is already in the mitigation cache
+}
+
+// New creates a new Limiter with the provided Redis client and options
+//
+// Note that rdb needs to be carefully configured for timeouts if you expect redis outages to not have severe impacts on latency.
+//
+// KeyConfFn returns a KeyConf for a given key. This will be called lazily, once per key, until `Limiter.Refresh()` or `Limiter.RefreshKey(key string)` is called.
+func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Context, key string) *KeyConf, options ...Options) *Limiter {
 	l := &Limiter{
 		logger: zap.NewNop(),
 		rdb:    rdb,
 		// TODO: expire keyConfCache entries
 		keyConfCache: sync.Map{},
-		keyConfFn:    func(ctx context.Context, key string) *KeyConf { return &KeyConf{rate: 100, interval: time.Second} },
+		keyConfFn:    keyConfFn,
 		incrChan:     make(chan string),
 		doneChan:     make(chan struct{}),
 		failClosed:   false,
 	}
 	if len(options) > 0 {
 		l.logger = options[0].Logger
-		l.keyConfFn = options[0].KeyConfFn
 		l.failClosed = options[0].FailClosed
 	}
 	l.wg.Add(1)
@@ -61,25 +63,28 @@ type Limiter struct {
 	failClosed   bool
 }
 
-// Close stops all goroutines, flushes logging, and waits for completion
+// Close stops all goroutines, flushes logging, and waits for completion.
 func (l *Limiter) Close() {
 	l.doneChan <- struct{}{}
 	l.logger.Sync()
 	l.wg.Wait()
 }
 
-// Refresh causes the KeyConfFn to be called again for all keys (lazily)
+// Refresh causes the KeyConfFn to be called again for all keys (lazily).
+//
 // If your rate limit is changing globally, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) Refresh(ctx context.Context) {
 	l.keyConfCache.Clear()
 }
 
-// RefreshKey causes the KeyConfFn to be called again for the specified key (lazily)
+// RefreshKey causes the KeyConfFn to be called again for the specified key (lazily).
+//
 // If your rate limit is changing for a specific key, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) RefreshKey(ctx context.Context, key string) {
 	l.keyConfCache.Delete(key)
 }
 
+// keyConf returns the KeyConf for a given key, calling the KeyConfFn if it hasn't been called for this key yet
 func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 	keyConf, ok := l.keyConfCache.Load(key)
 	if !ok {
@@ -89,20 +94,23 @@ func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 	return keyConf.(*KeyConf)
 }
 
+// increment increments the key and checks if it's over the rate limit
+//
+// If the key is over the rate limit, it will be mitigated
 func (l *Limiter) increment(ctx context.Context, key string) {
 	ctx = zax.Set(ctx, []zap.Field{zap.String("key", key)})
 	logger := l.logger.With(zax.Get(ctx)...)
 	keyConf := l.keyConf(ctx, key)
-	curIntStart := time.Now().Truncate(keyConf.interval)
+	curIntStart := time.Now().Truncate(keyConf.Interval)
 	curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
 	res, err := l.rdb.Incr(context.Background(), curKey).Result()
 	if err != nil && !errors.Is(err, redis.ErrClosed) {
 		logger.Error("error incrementing key", zap.String("key", curKey), zap.Error(err))
 	}
 	if err == nil && res == 1 {
-		l.rdb.ExpireNX(context.Background(), key, max(3*keyConf.interval, time.Second))
+		l.rdb.ExpireNX(context.Background(), key, max(3*keyConf.Interval, time.Second))
 	}
-	if res >= keyConf.rate {
+	if res >= keyConf.Rate {
 		l.mitigate(ctx, key)
 	}
 }
@@ -129,8 +137,8 @@ func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 
 	now := time.Now()
 	keyConf := l.keyConf(ctx, key)
-	curIntStart := now.Truncate(keyConf.interval)
-	prevIntStart := curIntStart.Add(-keyConf.interval)
+	curIntStart := now.Truncate(keyConf.Interval)
+	prevIntStart := curIntStart.Add(-keyConf.Interval)
 	intervals, err := l.rdb.MGet(ctx,
 		fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano()),
 		fmt.Sprintf("{%s}.%d", key, prevIntStart.UnixNano()),
@@ -157,11 +165,11 @@ func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 			}
 		}
 		curIntAgo := now.Sub(curIntStart)
-		portionOfLastInt := keyConf.interval - curIntAgo
-		percentOfLastInt := float64(portionOfLastInt.Nanoseconds()) / float64(keyConf.interval.Nanoseconds())
+		portionOfLastInt := keyConf.Interval - curIntAgo
+		percentOfLastInt := float64(portionOfLastInt.Nanoseconds()) / float64(keyConf.Interval.Nanoseconds())
 		rawOfLastInt := int64(float64(prev) * percentOfLastInt)
 		rateEstimate := int64(rawOfLastInt) + curr
-		if rateEstimate >= keyConf.rate {
+		if rateEstimate >= keyConf.Rate {
 			return false, nil
 		}
 	}
@@ -171,7 +179,7 @@ func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 func (l *Limiter) mitigate(ctx context.Context, key string) {
 	logger := l.logger.With(zax.Get(ctx)...)
 	keyConf := l.keyConf(ctx, key)
-	period := time.Duration(keyConf.interval.Nanoseconds() / keyConf.rate)
+	period := time.Duration(keyConf.Interval.Nanoseconds() / keyConf.Rate)
 	allow := func(ctx context.Context) bool {
 		allowed, err := l.checkRedis(ctx, key)
 		if err != nil {

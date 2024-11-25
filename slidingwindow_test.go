@@ -155,12 +155,9 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 
 	key := fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()%1000)
 	keyConfFn := func(ctx context.Context, key string) *KeyConf {
-		return &KeyConf{rate: rate, interval: interval}
+		return &KeyConf{Rate: rate, Interval: interval}
 	}
-	l := New(ctx, rdb, &Options{
-		Logger:    logger,
-		KeyConfFn: keyConfFn,
-	})
+	l := New(ctx, rdb, keyConfFn, Options{Logger: logger})
 	t.Cleanup(func() {
 		l.Close()
 		rdb.Close()
