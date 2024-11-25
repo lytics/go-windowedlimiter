@@ -54,11 +54,21 @@ func TestFailureMode(t *testing.T) {
 
 	// kill redis in a way that fails instantly
 	l.rdb = redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:0",
+		DialTimeout: 100 * time.Millisecond,
+		Addr:        "127.0.0.1:0",
 	})
 	assert.True(t, l.Allow(ctx, key), "should be allowed with redis down")
 	l.failClosed = true
 	assert.False(t, l.Allow(ctx, key), "should be denied with redis down")
+
+	// kill redis in a way that fails with a timeout
+	l.rdb = redis.NewClient(&redis.Options{
+		DialTimeout: 100 * time.Millisecond,
+		Addr:        "1.1.1.1:0",
+	})
+	assert.False(t, l.Allow(ctx, key), "should be denied with redis down")
+	l.failClosed = false
+	assert.True(t, l.Allow(ctx, key), "should be allowed with redis down")
 }
 
 func TestConcurrent(t *testing.T) {
@@ -134,7 +144,8 @@ func TestConcurrent(t *testing.T) {
 func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
 	t.Helper()
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		DialTimeout: 100 * time.Millisecond,
+		Addr:        "localhost:6379",
 	})
 
 	config := zaptest.Config()
