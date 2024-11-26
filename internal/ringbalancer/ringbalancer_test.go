@@ -1,161 +1,66 @@
 package ringbalancer
 
 import (
-	"sync"
 	"testing"
-	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestNew(t *testing.T) {
-	rb := New()
+	rb := New[chan struct{}]()
 	require.NotNil(t, rb, "New() returned nil")
 }
 
-func TestSubscribe(t *testing.T) {
-	rb := New()
-	entry := rb.Subscribe()
+func TestRegister(t *testing.T) {
+	rb := New[int]()
+	entry1 := rb.Register(1, nil)
+	require.Equal(t, 1, entry1.Value)
+	require.NotNil(t, entry1, "Register() returned nil entry")
+	require.Equal(t, 1, rb.cur.Value, "Expected cur to be the only entry")
+	require.Equal(t, rb.cur.next.Value, rb.cur.prev.Value, "Single entry should point to itself")
 
-	require.NotNil(t, entry, "Subscribe() returned nil entry")
-	require.NotNil(t, entry.C, "Subscribe() returned entry with nil channel")
-	assert.Equal(t, 1, len(rb.entries), "Expected 1 entry")
+	next := rb.Next()
+	require.Equal(t, 1, next.Value, "Next() should return the only entry")
+	next = rb.Next()
+	require.Equal(t, 1, next.Value, "Next() should return the only entry")
+
+	entry2 := rb.Register(2, nil)
+	require.NotNil(t, entry2, "Register() returned nil entry")
+	require.Equal(t, 2, entry2.Value)
+
+	checkOrdering(t, rb, []int{1, 2})
+
+	entry3 := rb.Register(3, nil)
+	require.NotNil(t, entry3, "Register() returned nil entry")
+	require.Equal(t, 3, entry3.Value)
+
+	checkOrdering(t, rb, []int{1, 2, 3})
+
+	entry4 := rb.Register(4, nil)
+	require.NotNil(t, entry4, "Register() returned nil entry")
+	require.Equal(t, 4, entry4.Value)
+
+	checkOrdering(t, rb, []int{1, 2, 3, 4})
+
+	entry1.Remove()
+	require.Equal(t, 2, rb.cur.Value, "Expected cur to be entry2")
+	checkOrdering(t, rb, []int{2, 3, 4})
+
+	entry4.Remove()
+	require.Equal(t, 2, rb.cur.Value, "Expected cur to be entry2")
+	checkOrdering(t, rb, []int{2, 3})
 }
 
-func TestTickWithNoSubscribers(t *testing.T) {
-	rb := New()
-	err := rb.Tick()
-
-	require.Error(t, err, "Expected error when ticking with no subscribers")
-}
-
-func TestTickDistribution(t *testing.T) {
-	rb := New()
-
-	num := 3
-	counts := make([]int, num)
-	var wg sync.WaitGroup
-	wg.Add(num)
-	for i := 0; i < num; i++ {
-		// Count received ticks
-		go func() {
-			defer wg.Done()
-			for range rb.Subscribe().C {
-				counts[i]++
-			}
-		}()
+func checkOrdering(t *testing.T, rb *Ring[int], expected []int) {
+	n := rb.cur
+	for _, val := range expected {
+		require.Equal(t, val, n.Value)
+		n = n.next
 	}
-	time.Sleep(10 * time.Millisecond)
+	require.Equal(t, expected[0], n.Value)
 
-	// Send 6 ticks
-	for i := 0; i < num*2; i++ {
-		err := rb.Tick()
-		require.NoError(t, err, "Unexpected error on tick %d: %v\n%v", i, err, rb.String())
-		time.Sleep(10 * time.Millisecond) // Give some time for processing
+	for i := 0; i < len(expected); i++ {
+		next := rb.Next()
+		require.Equal(t, expected[i], next.Value, "Next() should return the correct entry")
 	}
-
-	rb.Close()
-	wg.Wait()
-
-	// Each subscriber should have received 2 ticks
-	for i, count := range counts {
-		assert.Equal(t, 2, count, "Subscriber %d received wrong number of ticks", i)
-	}
-}
-
-func TestClosedEntryRemoval(t *testing.T) {
-	rb := New()
-
-	entry1 := rb.Subscribe()
-	entry2 := rb.Subscribe()
-
-	assert.Len(t, rb.entries, 2, "Expected 2 entries")
-	entry1.Close()
-	assert.Len(t, rb.entries, 1, "Expected 1 entries")
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		require.NoError(t, entry2.Wait())
-	}() // Drain the channel
-
-	time.Sleep(10 * time.Millisecond)
-
-	// Tick should remove the closed entry
-	err := rb.Tick()
-	require.NoError(t, err, "Unexpected error on tick")
-
-	wg.Wait()
-}
-
-func TestConcurrentSubscribeAndTick(t *testing.T) {
-	rb := New()
-
-	num := 2
-	counts := make([]int, num)
-	var wgSub sync.WaitGroup
-	wgSub.Add(num)
-	// Concurrent subscribes
-	for i := 0; i < num; i++ {
-		go func() {
-			defer wgSub.Done()
-			for range rb.Subscribe().C {
-				counts[i]++
-			}
-		}()
-	}
-	time.Sleep(10 * time.Millisecond)
-
-	var wgTick sync.WaitGroup
-	wgTick.Add(num)
-	// Concurrent ticks
-	for i := 0; i < num; i++ {
-		go func() {
-			defer wgTick.Done()
-			for j := 0; j < 10; j++ {
-				err := rb.Tick()
-				require.NoError(t, err)
-				time.Sleep(10 * time.Millisecond)
-			}
-		}()
-	}
-
-	wgTick.Wait()
-	rb.Close()
-	wgSub.Wait()
-}
-
-func TestEntryCloseIdempotency(t *testing.T) {
-	rb := New()
-	entry := rb.Subscribe()
-
-	// Should be able to close multiple times without panic
-	entry.Close()
-	entry.Close()
-	entry.Close()
-}
-
-func TestCloseWhileWriting(t *testing.T) {
-	rb := New()
-	entry := rb.Subscribe()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// Start goroutine that will close the entry while Tick is trying to write
-	go func() {
-		defer wg.Done()
-		time.Sleep(50 * time.Millisecond) // Give time for Tick to start
-		entry.Close()
-	}()
-
-	// Try to tick repeatedly - this should not panic even if the entry is closed
-	for i := 0; i < 100; i++ {
-		rb.Tick()
-		time.Sleep(1 * time.Millisecond)
-	}
-
-	wg.Wait()
 }

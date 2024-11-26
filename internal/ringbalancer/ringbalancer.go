@@ -3,7 +3,6 @@ package ringbalancer
 import (
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 )
@@ -11,121 +10,128 @@ import (
 // ErrDone to any active subscriber(s) when the Entry or Balancer is closed
 var ErrDone = errors.New("done")
 
-type Entry struct {
-	C chan struct{} // C is the channel that will receive ticks to allow an unblock
-	b *Balancer     // b is the balancer this entry is subscribed to (for access to the mutex)
+type Element[T any] struct {
+	Value   T                     // Value is the user-supplied value being balanced
+	cleanup func(element T) error // cleanup is called when the element is removed from the ring
+	b       *Ring[T]              // b is the balancer this entry is subscribed to (for access to the mutex)
+	prev    *Element[T]
+	next    *Element[T]
 }
 
-// Close closes the entry and removes it from the balancer
-func (re *Entry) Close() {
+// Remove closes the entry and removes it from the balancer
+//
+// Runs Element.Cleanup after removing the entry from the ring
+func (re *Element[any]) Remove() error {
 	re.b.mu.Lock()
 	defer re.b.mu.Unlock()
-	if len(re.b.entries) > 0 {
-		i := slices.Index(re.b.entries, re)
-		re.b.entries = slices.Delete(re.b.entries, i, i+1)
+	re.next.prev = re.prev
+	re.prev.next = re.next
+	if re.b.cur == re {
+		re.b.cur = re.next
 	}
-	// we don't need to close as the GC will get it, and we won't panic if we don't even try
-	// close(re.C)
-	if re.b.i >= len(re.b.entries) {
-		re.b.i = 0
-	}
-}
-
-// Wait blocks until this subscriber receives a tick, or the entry is closed
-// returns ErrDone if the entry is closed
-func (re *Entry) Wait() error {
-	_, ok := <-re.C
-	if !ok {
-		return ErrDone
+	if re.cleanup != nil {
+		return re.cleanup(re.Value)
 	}
 	return nil
 }
 
-// Balancer is a ring balancer that distributes ticks to subscribers in a round-robin fashion
-type Balancer struct {
-	entries []*Entry // entries is the list of subscribers
-	i       int      // i is the current index in the ring
-	mu      sync.Mutex
+// Ring is a doubly linked ring, optimized equally for reads and registers
+type Ring[T any] struct {
+	cur *Element[T]
+	mu  sync.Mutex
 }
 
 // New creates a new Balancer
-func New() *Balancer {
-	return &Balancer{}
+func New[T any]() *Ring[T] {
+	return &Ring[T]{}
 }
 
-// Close closes all subscribers and removes them from the balancer
-func (rb *Balancer) Close() {
+// Close clears the ring of all Elements, running each Cleanup function while doing so
+func (rb *Ring[T]) Close() {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
-	for _, e := range rb.entries {
-		close(e.C)
+	if rb.cur == nil {
+		return
 	}
-	rb.entries = []*Entry{}
-	rb.i = 0
+	if rb.cur.prev == nil {
+		// only one element
+		rb.cur.cleanup(rb.cur.Value)
+		rb.cur = nil
+		return
+	}
+	rb.cur.prev.next = nil
+	for cur := rb.cur; cur != nil; cur = cur.next {
+		cur.cleanup(cur.Value)
+	}
+	rb.cur = nil
+}
+
+// Empty returns true if the ring is empty
+func (rb *Ring[T]) Empty() bool {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	return rb.cur == nil
 }
 
 // String returns a string representation of the balancer for debugging
-func (rb *Balancer) String() string {
-	output := []string{}
-	output = append(output, "Balancer{")
-	for i, e := range rb.entries {
-		output = append(output, fmt.Sprintf("  Entry %d: %+v", i, e))
-	}
-	output = append(output, fmt.Sprintf("  i: %d", rb.i))
-	output = append(output, "}\n")
-	return strings.Join(output, "\n")
-}
-
-// Subscribers returns the number of subscribers currently registered
-func (rb *Balancer) Subscribers() int {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	return len(rb.entries)
-}
-
-// Subscribe creates a new subscriber entry
-func (rb *Balancer) Subscribe() *Entry {
-	entry := &Entry{
-		C: make(chan struct{}),
-		b: rb,
-	}
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-	rb.entries = append(rb.entries, entry)
-	return entry
-}
-
-// Tick sends a tick to the next subscriber in the ring
-// it will try each subscriber once before returning an error
-func (rb *Balancer) Tick() error {
+func (rb *Ring[T]) String() string {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	retries := 0
-RETRY:
-	retry := false
-
-	if len(rb.entries) == 0 {
-		return errors.New("no subscribers")
+	if rb.cur == nil {
+		return "Empty Ring"
 	}
 
-	select {
-	case rb.entries[rb.i].C <- struct{}{}:
-	default:
-		retry = true
-	}
+	var sb strings.Builder
+	sb.WriteString("Current      | Previous     | Thing        | Next\n")
+	sb.WriteString("------------ | ------------ | ------------ | ------------\n")
 
-	rb.i++
-	if rb.i >= len(rb.entries) {
-		rb.i = 0
-	}
+	cur := rb.cur
+	for {
+		prev := cur.prev
+		next := cur.next
 
-	if retry {
-		retries++
-		if len(rb.entries) <= retries {
-			return fmt.Errorf("send failed, no listenersd")
+		sb.WriteString(fmt.Sprintf("%p | %p | %v | %p\n", cur, prev, cur.Value, next))
+
+		cur = next
+		if cur == rb.cur {
+			break
 		}
-		goto RETRY
 	}
-	return nil
+
+	return sb.String()
+}
+
+// Register creates a new element in the ring in the slot before Ring.cur
+func (rb *Ring[T]) Register(thing T, cleanup func(T) error) *Element[T] {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	element := &Element[T]{
+		Value:   thing,
+		cleanup: cleanup,
+		b:       rb,
+	}
+	if rb.cur == nil {
+		// empty ring, set this element as the only element
+		element.next = element
+		element.prev = element
+		rb.cur = element
+		return element
+	}
+	element.next = rb.cur
+	element.prev = rb.cur.prev
+	rb.cur.prev.next = element
+	rb.cur.prev = element
+	return element
+}
+
+// Next returns the current element and advances the ring to the next element.
+func (rb *Ring[T]) Next() *Element[T] {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	cur := rb.cur
+	if cur != nil {
+		rb.cur = rb.cur.next
+	}
+	return cur
 }

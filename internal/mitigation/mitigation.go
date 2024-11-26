@@ -9,6 +9,7 @@ package mitigation
 
 import (
 	"context"
+	"errors"
 	"runtime/pprof"
 	"sync"
 	"time"
@@ -17,22 +18,35 @@ import (
 	"github.com/vitaminmoo/go-slidingwindow/internal/ringbalancer"
 )
 
-var (
-	// This cache is in a package global as keys are global - like the external redis server
-	mitigationCache = xsync.NewMapOf[*mitigation]()
-	ttlMultiplier   = time.Duration(3)
-)
+var ttlMultiplier = time.Duration(3)
 
-// mitigation exists to allow caching of a mitigated state, and cooperative
-// sharing of requests as the mitigation expires and is refreshed
-type mitigation struct {
-	period  time.Duration              // the period we should retry the allow function at
-	allowFn func(context.Context) bool // the function we should call to see if a request is allowed
-	ttl     time.Time                  // when the mitigation will be deleted entirely, shutting down goroutines
-	until   time.Time                  // when the mitigation will be re-evaluated
-	rb      *ringbalancer.Balancer     // the ring balancer for the mitigation
-	ctx     context.Context            // context for cancellation of the mitigation garbage collector goroutine
-	mu      sync.Mutex                 // mutex for the mitigation
+type tick struct {
+	C    chan struct{}
+	Done chan struct{}
+}
+
+// Mitigation exists to allow caching of a mitigated state, and cooperative
+// sharing of requests as the Mitigation expires and is refreshed
+type Mitigation struct {
+	period time.Duration             // the period we should retry the allow function at
+	ttl    time.Time                 // when the mitigation will be deleted entirely, shutting down goroutines
+	until  time.Time                 // when the mitigation will be re-evaluated
+	rb     *ringbalancer.Ring[*tick] // the ring balancer for the mitigation
+	ctx    context.Context           // context for cancellation of the mitigation garbage collector goroutine
+	mu     sync.Mutex                // mutex for the mitigation
+}
+
+func New(allowFn func(context.Context, string) bool) *MitigationCache {
+	mc := &MitigationCache{
+		cache:   xsync.NewMapOf[*Mitigation](),
+		allowFn: allowFn,
+	}
+	return mc
+}
+
+type MitigationCache struct {
+	cache   *xsync.MapOf[string, *Mitigation]
+	allowFn func(context.Context, string) bool
 }
 
 // Trigger creates a new mitigation or refreshes an existing one's ttl
@@ -44,27 +58,27 @@ type mitigation struct {
 // period is how often to retry the allowFn, which will be the maximum rate requests are allowed
 //
 // allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive. allowFn must be thread safe.
-func Trigger(ctx context.Context, key string, period time.Duration, allowFn func(context.Context) bool) {
-	m, ok := mitigationCache.Load(key)
+func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.Duration) {
+	m, ok := mc.cache.Load(key)
 	if ok {
 		m.mu.Lock()
 		m.ttl = time.Now().Add(ttlMultiplier * period)
 		m.mu.Unlock()
 		return
 	}
-	m = &mitigation{
-		period:  period,
-		allowFn: allowFn,
-		ttl:     time.Now().Add(ttlMultiplier * period),
-		until:   time.Now().Add(period),
-		rb:      ringbalancer.New(),
-		ctx:     ctx,
+	m = &Mitigation{
+		period: period,
+		ttl:    time.Now().Add(ttlMultiplier * period),
+		until:  time.Now().Add(period),
+		rb:     ringbalancer.New[*tick](),
+		ctx:    ctx,
 	}
-	mitigationCache.Store(key, m)
+	mc.cache.Store(key, m)
 
 	go pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
+	TICK:
 		for {
 			select {
 			case <-ctx.Done():
@@ -73,9 +87,9 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 				m.mu.Lock()
 				now := time.Now()
 				if now.After(m.ttl) {
-					if m.rb.Subscribers() == 0 {
+					if m.rb.Empty() {
 						// the mitigation is expired, nuke it
-						if m, ok := mitigationCache.LoadAndDelete(key); ok {
+						if m, ok := mc.cache.LoadAndDelete(key); ok {
 							m.rb.Close()
 						}
 						m.mu.Unlock()
@@ -88,8 +102,24 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 				}
 				if now.After(m.until) {
 					// the mitigation is ready to be re-evaluated
-					if m.allowFn(ctx) {
-						m.rb.Tick()
+					if mc.allowFn(ctx, key) {
+					NEXT:
+						next := m.rb.Next()
+						if next == nil {
+							// empty ring, can't send to anyone
+							m.mu.Unlock()
+							continue TICK
+						}
+						select {
+						case next.Value.C <- struct{}{}:
+						default:
+							// no listener on the blocking channel, remove it from the ring
+							err := next.Remove()
+							if err != nil {
+								panic(err)
+							}
+							goto NEXT
+						}
 					} else {
 						m.ttl = now.Add(ttlMultiplier * m.period)
 						m.until = now.Add(m.period)
@@ -104,25 +134,38 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 // Wait blocks until the mitigation fires, is cancelled via context, or is done.
 //
 // Note that currently, Wait() unsubscribe/resubscribes to the ringbuffer every time it's called which is pretty non-ideal.
-func Wait(ctx context.Context, key string) error {
-	m, ok := mitigationCache.Load(key)
+func (mc *MitigationCache) Wait(ctx context.Context, key string) error {
+	m, ok := mc.cache.Load(key)
 	if !ok {
 		// we're not actually mitigated
 		return nil
 	}
-	entry := m.rb.Subscribe()
+	t := &tick{
+		C:    make(chan struct{}),
+		Done: make(chan struct{}),
+	}
+	cleanup := func(t *tick) error {
+		select {
+		case t.Done <- struct{}{}:
+		default: // already done
+		}
+		return nil
+	}
+	entry := m.rb.Register(t, cleanup)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-entry.C:
-		entry.Close()
+	case <-t.Done:
+		return errors.New("done")
+	case <-t.C:
+		entry.Remove()
 		return nil
 	}
 }
 
 // Allow reports whether a request is allowed for the given key.
-func Allow(ctx context.Context, key string) bool {
-	m, ok := mitigationCache.Load(key)
+func (mc *MitigationCache) Allow(ctx context.Context, key string) bool {
+	m, ok := mc.cache.Load(key)
 	if !ok {
 		// we're not actually mitigated, allow immediately
 		return true
@@ -130,7 +173,7 @@ func Allow(ctx context.Context, key string) bool {
 	now := time.Now()
 	allowed := false
 	if now.After(m.until) {
-		allowed = m.allowFn(ctx)
+		allowed = mc.allowFn(ctx, key)
 	}
 	if allowed {
 		return true

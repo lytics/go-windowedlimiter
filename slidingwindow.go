@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/puzpuzpuz/xsync"
 	"github.com/redis/go-redis/v9"
 	"github.com/vitaminmoo/go-slidingwindow/internal/mitigation"
 	"github.com/yuseferi/zax/v2"
@@ -37,7 +38,7 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 		logger: zap.NewNop(),
 		rdb:    rdb,
 		// TODO: expire keyConfCache entries
-		keyConfCache: sync.Map{},
+		keyConfCache: xsync.NewMapOf[*KeyConf](),
 		keyConfFn:    keyConfFn,
 		incrChan:     make(chan string),
 		doneChan:     make(chan struct{}),
@@ -47,20 +48,31 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 		l.logger = options[0].Logger
 		l.failClosed = options[0].FailClosed
 	}
+	allow := func(ctx context.Context, key string) bool {
+		allowed, err := l.checkRedis(ctx, key)
+		if err != nil {
+			l.logger.Debug("failed to check redis for mitigation status", zap.Error(err))
+			return !l.failClosed
+		}
+		return allowed
+	}
+	mit := mitigation.New(allow)
+	l.mitigationCache = mit
 	l.wg.Add(1)
 	go pprof.Do(ctx, pprof.Labels("name", "slidingwindow_incrementer"), func(ctx context.Context) { l.incrementer(ctx) })
 	return l
 }
 
 type Limiter struct {
-	logger       *zap.Logger
-	rdb          redis.Cmdable
-	keyConfCache sync.Map
-	keyConfFn    func(ctx context.Context, key string) *KeyConf
-	incrChan     chan string
-	doneChan     chan struct{}
-	wg           sync.WaitGroup
-	failClosed   bool
+	logger          *zap.Logger
+	rdb             redis.Cmdable
+	mitigationCache *mitigation.MitigationCache
+	keyConfCache    *xsync.MapOf[string, *KeyConf]
+	keyConfFn       func(ctx context.Context, key string) *KeyConf
+	incrChan        chan string
+	doneChan        chan struct{}
+	wg              sync.WaitGroup
+	failClosed      bool
 }
 
 // Close stops all goroutines, flushes logging, and waits for completion.
@@ -74,7 +86,10 @@ func (l *Limiter) Close() {
 //
 // If your rate limit is changing globally, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) Refresh(ctx context.Context) {
-	l.keyConfCache.Clear()
+	l.keyConfCache.Range(func(key string, _ *KeyConf) bool {
+		l.keyConfCache.Delete(key)
+		return true
+	})
 }
 
 // RefreshKey causes the KeyConfFn to be called again for the specified key (lazily).
@@ -91,7 +106,7 @@ func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 		keyConf = l.keyConfFn(ctx, key)
 		l.keyConfCache.Store(key, keyConf)
 	}
-	return keyConf.(*KeyConf)
+	return keyConf
 }
 
 // increment increments the key and checks if it's over the rate limit
@@ -180,16 +195,8 @@ func (l *Limiter) mitigate(ctx context.Context, key string) {
 	logger := l.logger.With(zax.Get(ctx)...)
 	keyConf := l.keyConf(ctx, key)
 	period := time.Duration(keyConf.Interval.Nanoseconds() / keyConf.Rate)
-	allow := func(ctx context.Context) bool {
-		allowed, err := l.checkRedis(ctx, key)
-		if err != nil {
-			logger.Debug("failed to check redis for mitigation status", zap.Error(err))
-			return !l.failClosed
-		}
-		return allowed
-	}
 	logger.Debug("mitigating", zap.Duration("period", period))
-	mitigation.Trigger(ctx, key, period, allow)
+	l.mitigationCache.Trigger(ctx, key, period)
 }
 
 func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool) {
@@ -213,7 +220,7 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 			}
 		}
 	}()
-	if mitigation.Allow(ctx, key) {
+	if l.mitigationCache.Allow(ctx, key) {
 		logger.Debug("allowed by mitigation")
 		return true
 	}
@@ -238,7 +245,7 @@ func (l *Limiter) wait(ctx context.Context, key string) {
 	// now := time.Now()
 	retries := 0
 RETRY: // TODO: exponential backoff?
-	err := mitigation.Wait(ctx, key)
+	err := l.mitigationCache.Wait(ctx, key)
 	if err != nil {
 		logger.Error("waiting", zap.Error(err))
 		retries++
