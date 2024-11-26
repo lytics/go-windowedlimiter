@@ -71,26 +71,29 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 				return
 			case <-ticker.C:
 				m.mu.Lock()
-				if time.Now().After(m.ttl) {
-					if mit, ok := mitigationCache.LoadAndDelete(key); ok {
-						mit.(*mitigation).rb.Close()
+				now := time.Now()
+				if now.After(m.ttl) {
+					if m.rb.Subscribers() == 0 {
+						// the mitigation is expired, nuke it
+						if mit, ok := mitigationCache.LoadAndDelete(key); ok {
+							mit.(*mitigation).rb.Close()
+						}
+						m.mu.Unlock()
+						return
 					}
-					m.mu.Unlock()
-					return
-				}
-				if time.Now().After(m.until) {
-					if m.allowFn(ctx) {
-						m.rb.Tick()
-					} else {
-						m.ttl = time.Now().Add(ttlMultiplier * m.period)
-						m.until = time.Now().Add(m.period)
-					}
-				}
-				if m.rb.Subscribers() > 0 {
 					// there are still subscribers, extend the mitigation
 					// this is kinda incompatible with moving from Wait() to something
 					// more stateful
 					m.ttl = time.Now().Add(ttlMultiplier * m.period)
+				}
+				if now.After(m.until) {
+					// the mitigation is ready to be re-evaluated
+					if m.allowFn(ctx) {
+						m.rb.Tick()
+					} else {
+						m.ttl = now.Add(ttlMultiplier * m.period)
+						m.until = now.Add(m.period)
+					}
 				}
 				m.mu.Unlock()
 			}
@@ -119,18 +122,16 @@ func Wait(ctx context.Context, key string) error {
 }
 
 // Allow reports whether a request is allowed for the given key.
-//
-// Note that Allow will call allowFn
 func Allow(ctx context.Context, key string) bool {
-	var allowed bool
-	var m *mitigation
 	mit, ok := mitigationCache.Load(key)
 	if !ok {
 		// we're not actually mitigated, allow immediately
 		return true
 	}
-	m = mit.(*mitigation)
-	if time.Now().After(m.until) {
+	m := mit.(*mitigation)
+	now := time.Now()
+	allowed := false
+	if now.After(m.until) {
 		allowed = m.allowFn(ctx)
 	}
 	if allowed {
@@ -138,6 +139,7 @@ func Allow(ctx context.Context, key string) bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ttl = time.Now().Add(3 * m.period)
+	// bump the ttl as if we're only using Allow, the per-mitigation gc/ticker goroutine will not
+	m.ttl = now.Add(3 * m.period)
 	return false
 }
