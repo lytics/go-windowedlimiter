@@ -13,12 +13,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/puzpuzpuz/xsync"
 	"github.com/vitaminmoo/go-slidingwindow/internal/ringbalancer"
 )
 
 var (
 	// This cache is in a package global as keys are global - like the external redis server
-	mitigationCache = sync.Map{}
+	mitigationCache = xsync.NewMapOf[*mitigation]()
 	ttlMultiplier   = time.Duration(3)
 )
 
@@ -44,15 +45,14 @@ type mitigation struct {
 //
 // allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive. allowFn must be thread safe.
 func Trigger(ctx context.Context, key string, period time.Duration, allowFn func(context.Context) bool) {
-	mit, ok := mitigationCache.Load(key)
+	m, ok := mitigationCache.Load(key)
 	if ok {
-		m := mit.(*mitigation)
 		m.mu.Lock()
 		m.ttl = time.Now().Add(ttlMultiplier * period)
 		m.mu.Unlock()
 		return
 	}
-	m := &mitigation{
+	m = &mitigation{
 		period:  period,
 		allowFn: allowFn,
 		ttl:     time.Now().Add(ttlMultiplier * period),
@@ -75,8 +75,8 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 				if now.After(m.ttl) {
 					if m.rb.Subscribers() == 0 {
 						// the mitigation is expired, nuke it
-						if mit, ok := mitigationCache.LoadAndDelete(key); ok {
-							mit.(*mitigation).rb.Close()
+						if m, ok := mitigationCache.LoadAndDelete(key); ok {
+							m.rb.Close()
 						}
 						m.mu.Unlock()
 						return
@@ -105,12 +105,11 @@ func Trigger(ctx context.Context, key string, period time.Duration, allowFn func
 //
 // Note that currently, Wait() unsubscribe/resubscribes to the ringbuffer every time it's called which is pretty non-ideal.
 func Wait(ctx context.Context, key string) error {
-	value, ok := mitigationCache.Load(key)
+	m, ok := mitigationCache.Load(key)
 	if !ok {
 		// we're not actually mitigated
 		return nil
 	}
-	m := value.(*mitigation)
 	entry := m.rb.Subscribe()
 	select {
 	case <-ctx.Done():
@@ -123,12 +122,11 @@ func Wait(ctx context.Context, key string) error {
 
 // Allow reports whether a request is allowed for the given key.
 func Allow(ctx context.Context, key string) bool {
-	mit, ok := mitigationCache.Load(key)
+	m, ok := mitigationCache.Load(key)
 	if !ok {
 		// we're not actually mitigated, allow immediately
 		return true
 	}
-	m := mit.(*mitigation)
 	now := time.Now()
 	allowed := false
 	if now.After(m.until) {
