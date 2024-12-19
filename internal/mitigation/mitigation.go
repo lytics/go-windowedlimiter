@@ -3,8 +3,6 @@
 // While a key is not mitigated, `Allow()` and `Wait()` will only do a `xsync.Map` lookup and then return immediately.
 //
 // While a key is mitigated, a single goroutine will be responsible for checking the allowFn and distributing the the allowed requests to all callers evenly.
-//
-// Keys are currently stored globally
 package mitigation
 
 import (
@@ -15,7 +13,7 @@ import (
 	"time"
 
 	"github.com/puzpuzpuz/xsync"
-	"github.com/vitaminmoo/go-slidingwindow/internal/ringbalancer"
+	"github.com/vitaminmoo/go-slidingwindow/internal/tickqueue"
 )
 
 var ttlMultiplier = time.Duration(3)
@@ -28,13 +26,13 @@ type tick struct {
 // Mitigation exists to allow caching of a mitigated state, and cooperative
 // sharing of requests as the Mitigation expires and is refreshed
 type Mitigation struct {
-	period   time.Duration             // the period we should retry the allow function at
-	ttl      time.Time                 // when the mitigation will be deleted entirely, shutting down goroutines
-	until    time.Time                 // when the mitigation will be re-evaluated
-	rb       *ringbalancer.Ring[*tick] // the ring balancer for the mitigation
-	ctx      context.Context           // context for cancellation of the mitigation garbage collector goroutine
-	mu       sync.Mutex                // mutex for the mitigation
-	allowOne bool                      // if false, first allowed request toggles this for the next Allow() call to consume
+	period   time.Duration           // the period we should retry the allow function at
+	ttl      time.Time               // when the mitigation will be deleted entirely, shutting down goroutines
+	until    time.Time               // when the mitigation will be re-evaluated
+	q        *tickqueue.Queue[*tick] // the queue for the mitigation
+	ctx      context.Context         // context for cancellation of the mitigation garbage collector goroutine
+	mu       sync.Mutex              // mutex for the mitigation
+	allowOne bool                    // if false, first allowed request toggles this for the next Allow() call to consume
 }
 
 func New(allowFn func(context.Context, string) bool) *MitigationCache {
@@ -71,7 +69,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 		period: period,
 		ttl:    time.Now().Add(ttlMultiplier * period),
 		until:  time.Now().Add(period),
-		rb:     ringbalancer.New[*tick](),
+		q:      tickqueue.New[*tick](),
 		ctx:    ctx,
 	}
 	mc.cache.Store(key, m)
@@ -88,11 +86,9 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 				m.mu.Lock()
 				now := time.Now()
 				if now.After(m.ttl) {
-					if m.rb.Empty() {
+					if m.q.Peek() == nil {
 						// the mitigation is expired, nuke it
-						if m, ok := mc.cache.LoadAndDelete(key); ok {
-							m.rb.Close()
-						}
+						mc.cache.Delete(key)
 						m.mu.Unlock()
 						return
 					}
@@ -111,7 +107,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 							m.mu.Unlock()
 							continue TICK
 						}
-						next := m.rb.Next()
+						next := m.q.Shift()
 						if next == nil {
 							// empty ring, can't send to anyone
 							m.mu.Unlock()
@@ -158,7 +154,7 @@ func (mc *MitigationCache) Wait(ctx context.Context, key string) error {
 		}
 		return nil
 	}
-	entry := m.rb.Register(t, cleanup)
+	entry := m.q.Push(t, cleanup)
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
