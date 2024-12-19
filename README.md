@@ -22,7 +22,6 @@ Currently extremely pre-alpha. The API is guaranteed to change, as are the inter
     - [x] Use a single goroutine to control the mitigation cache per-process
     - [x] Load balance the allowed rate across all waiting threads
     - [ ] Have the mitigation cache coordinate cross-process such that all processes/threads only try at the allowed rate
-- [x] Configurable open or closed failure modes (default to open)
 
 ## Design
 
@@ -82,7 +81,6 @@ For each key in the mitigation cache, a single goroutine will be spawned that wi
 ##### TODO
 
 - [ ] Find a better way to determine when to allow the mitigation to expire
-- [ ] Find a way to healtcheck redis so `Options.failClosed` can be implemented in a way that works for keys that aren't mitigated. During incrementing maybe?
 
 #### Rate Limiter
 
@@ -90,3 +88,8 @@ For each key in the mitigation cache, a single goroutine will be spawned that wi
 
 - [ ] TTL for keyConfCache entries?
 - [ ] Exponential backoff of retries in wait? If the mitigation cache can actually return real errors in the future
+
+- look at a doubly linked list?
+- add channel based usecase api
+- make allow have dedicated slots in the mitigation cache which get reset by tick
+- add jitter to mitigation ticker?

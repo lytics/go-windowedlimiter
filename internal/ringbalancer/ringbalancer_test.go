@@ -64,3 +64,55 @@ func checkOrdering(t *testing.T, rb *Ring[int], expected []int) {
 		require.Equal(t, expected[i], next.Value, "Next() should return the correct entry")
 	}
 }
+
+func BenchmarkRegister(b *testing.B) {
+	rb := New[int]()
+	for i := 0; i < b.N; i++ {
+		rb.Register(i, nil)
+	}
+}
+
+func BenchmarkRemove(b *testing.B) {
+	rb := New[int]()
+	elements := make([]*Element[int], b.N)
+	for i := 0; i < b.N; i++ {
+		elements[i] = rb.Register(i, nil)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		elements[i].Remove()
+	}
+}
+
+func BenchmarkNextEmpty(b *testing.B) {
+	rb := New[int]()
+	for i := 0; i < b.N; i++ {
+		rb.Next()
+	}
+}
+
+func BenchmarkNext(b *testing.B) {
+	rb := New[int]()
+	for i := 0; i < 100; i++ { // Pre-populate with a reasonable number of elements
+		rb.Register(i, nil)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rb.Next()
+	}
+}
+
+func BenchmarkRemoveWithCleanup(b *testing.B) {
+	rb := New[int]()
+	cleanup := func(int) error { return nil }
+	elements := make([]*Element[int], b.N)
+	for i := 0; i < b.N; i++ {
+		elements[i] = rb.Register(i, cleanup)
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		elements[i].Remove()
+	}
+}

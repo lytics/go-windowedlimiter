@@ -1,6 +1,6 @@
 // Package mitigation provides a way to fast-path allows for keys that are not actively hitting their rate limit.
 //
-// While a key is not mitigated, `Allow()` and `Wait()` will only do a `sync.Map` lookup and then return immediately.
+// While a key is not mitigated, `Allow()` and `Wait()` will only do a `xsync.Map` lookup and then return immediately.
 //
 // While a key is mitigated, a single goroutine will be responsible for checking the allowFn and distributing the the allowed requests to all callers evenly.
 //
@@ -28,12 +28,13 @@ type tick struct {
 // Mitigation exists to allow caching of a mitigated state, and cooperative
 // sharing of requests as the Mitigation expires and is refreshed
 type Mitigation struct {
-	period time.Duration             // the period we should retry the allow function at
-	ttl    time.Time                 // when the mitigation will be deleted entirely, shutting down goroutines
-	until  time.Time                 // when the mitigation will be re-evaluated
-	rb     *ringbalancer.Ring[*tick] // the ring balancer for the mitigation
-	ctx    context.Context           // context for cancellation of the mitigation garbage collector goroutine
-	mu     sync.Mutex                // mutex for the mitigation
+	period   time.Duration             // the period we should retry the allow function at
+	ttl      time.Time                 // when the mitigation will be deleted entirely, shutting down goroutines
+	until    time.Time                 // when the mitigation will be re-evaluated
+	rb       *ringbalancer.Ring[*tick] // the ring balancer for the mitigation
+	ctx      context.Context           // context for cancellation of the mitigation garbage collector goroutine
+	mu       sync.Mutex                // mutex for the mitigation
+	allowOne bool                      // if false, first allowed request toggles this for the next Allow() call to consume
 }
 
 func New(allowFn func(context.Context, string) bool) *MitigationCache {
@@ -104,6 +105,12 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 					// the mitigation is ready to be re-evaluated
 					if mc.allowFn(ctx, key) {
 					NEXT:
+						if !m.allowOne {
+							// feed first allowed request to any realtime Allow() that happens
+							m.allowOne = true
+							m.mu.Unlock()
+							continue TICK
+						}
 						next := m.rb.Next()
 						if next == nil {
 							// empty ring, can't send to anyone
@@ -170,17 +177,13 @@ func (mc *MitigationCache) Allow(ctx context.Context, key string) bool {
 		// we're not actually mitigated, allow immediately
 		return true
 	}
-	now := time.Now()
-	allowed := false
-	if now.After(m.until) {
-		allowed = mc.allowFn(ctx, key)
-	}
-	if allowed {
-		return true
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.allowOne {
+		m.allowOne = false
+		return true
+	}
 	// bump the ttl as if we're only using Allow, the per-mitigation gc/ticker goroutine will not
-	m.ttl = now.Add(3 * m.period)
+	m.ttl = time.Now().Add(3 * m.period)
 	return false
 }

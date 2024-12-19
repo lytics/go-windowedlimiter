@@ -24,10 +24,17 @@ type Element[T any] struct {
 func (re *Element[any]) Remove() error {
 	re.b.mu.Lock()
 	defer re.b.mu.Unlock()
-	re.next.prev = re.prev
-	re.prev.next = re.next
-	if re.b.cur == re {
-		re.b.cur = re.next
+	if re.next == re {
+		// last entry in the ring
+		re.next = nil
+		re.prev = nil
+		re.b.cur = nil
+	} else {
+		re.next.prev = re.prev
+		re.prev.next = re.next
+		if re.b.cur == re {
+			re.b.cur = re.next
+		}
 	}
 	if re.cleanup != nil {
 		return re.cleanup(re.Value)
