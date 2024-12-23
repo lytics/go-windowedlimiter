@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/puzpuzpuz/xsync"
-	"github.com/vitaminmoo/go-slidingwindow/internal/tickqueue"
+	"github.com/vitaminmoo/go-slidingwindow/internal/fifo"
 )
 
 var ttlMultiplier = time.Duration(3)
@@ -23,16 +23,15 @@ type tick struct {
 	Done chan struct{}
 }
 
-// Mitigation exists to allow caching of a mitigated state, and cooperative
-// sharing of requests as the Mitigation expires and is refreshed
+// Mitigation exists to allow caching of a mitigated state, and cooperative sharing of requests as the Mitigation expires and is refreshed
 type Mitigation struct {
-	period   time.Duration           // the period we should retry the allow function at
-	ttl      time.Time               // when the mitigation will be deleted entirely, shutting down goroutines
-	until    time.Time               // when the mitigation will be re-evaluated
-	q        *tickqueue.Queue[*tick] // the queue for the mitigation
-	ctx      context.Context         // context for cancellation of the mitigation garbage collector goroutine
-	mu       sync.Mutex              // mutex for the mitigation
-	allowOne bool                    // if false, first allowed request toggles this for the next Allow() call to consume
+	period   time.Duration      // the period we should retry the allow function at
+	ttl      time.Time          // when the mitigation will be deleted entirely, shutting down goroutines
+	until    time.Time          // when the mitigation will be re-evaluated
+	q        *fifo.Queue[*tick] // the queue for the mitigation
+	ctx      context.Context    // context for cancellation of the mitigation garbage collector goroutine
+	mu       sync.Mutex         // mutex for the mitigation
+	allowOne bool               // if false, first allowed request toggles this for the next Allow() call to consume
 }
 
 func New(allowFn func(context.Context, string) bool) *MitigationCache {
@@ -45,7 +44,7 @@ func New(allowFn func(context.Context, string) bool) *MitigationCache {
 
 type MitigationCache struct {
 	cache   *xsync.MapOf[string, *Mitigation]
-	allowFn func(context.Context, string) bool
+	allowFn func(ctx context.Context, key string) bool
 }
 
 // Trigger creates a new mitigation or refreshes an existing one's ttl
@@ -69,7 +68,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 		period: period,
 		ttl:    time.Now().Add(ttlMultiplier * period),
 		until:  time.Now().Add(period),
-		q:      tickqueue.New[*tick](),
+		q:      fifo.New[*tick](),
 		ctx:    ctx,
 	}
 	mc.cache.Store(key, m)

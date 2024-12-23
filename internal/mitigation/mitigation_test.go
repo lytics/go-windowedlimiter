@@ -14,7 +14,9 @@ func TestMitigate_AllowsRequests(t *testing.T) {
 	ctx := context.Background()
 	key := "test-allow"
 	period := 10 * time.Millisecond
-	mc := New(func(context.Context, string) bool { return true })
+	mc := New(
+		func(context.Context, string) bool { return true },
+	)
 
 	// Always allow requests
 	mc.Trigger(ctx, key, period)
@@ -30,7 +32,9 @@ func TestMitigate_BlocksRequests(t *testing.T) {
 	ctx := context.Background()
 	key := "test-block"
 	period := 10 * time.Millisecond
-	mc := New(func(context.Context, string) bool { return false })
+	mc := New(
+		func(context.Context, string) bool { return false },
+	)
 
 	// Never allow requests
 	mc.Trigger(ctx, key, period)
@@ -49,7 +53,9 @@ func TestMitigate_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	key := "test-cancel"
 	period := 10 * time.Millisecond
-	mc := New(func(context.Context, string) bool { return false })
+	mc := New(
+		func(context.Context, string) bool { return false },
+	)
 
 	mc.Trigger(ctx, key, period)
 
@@ -65,7 +71,9 @@ func TestMitigate_ContextCancellation(t *testing.T) {
 func TestWait_NonExistentKey(t *testing.T) {
 	ctx := context.Background()
 	key := "non-existent"
-	mc := New(func(context.Context, string) bool { return false })
+	mc := New(
+		func(context.Context, string) bool { return false },
+	)
 
 	err := mc.Wait(ctx, key)
 	if err != nil {
@@ -77,7 +85,9 @@ func TestMitigate_Expiration(t *testing.T) {
 	ctx := context.Background()
 	key := "test-expiration"
 	period := 10 * time.Millisecond
-	mc := New(func(context.Context, string) bool { return true })
+	mc := New(
+		func(context.Context, string) bool { return true },
+	)
 
 	mc.Trigger(ctx, key, period)
 
@@ -95,10 +105,12 @@ func TestMitigate_MultipleWaiters(t *testing.T) {
 	num := 10
 
 	var try int
-	mc := New(func(context.Context, string) bool {
-		try++
-		return try >= 5
-	})
+	mc := New(
+		func(context.Context, string) bool {
+			try++
+			return try >= 5
+		},
+	)
 
 	mc.Trigger(ctx, key, period)
 
@@ -130,10 +142,12 @@ func TestMitigate_PeriodReset(t *testing.T) {
 	period := 10 * time.Millisecond
 
 	allowCalls := atomic.Int32{}
-	mc := New(func(context.Context, string) bool {
-		allowCalls.Add(1)
-		return allowCalls.Load() > 2 // Allow after 2 failures
-	})
+	mc := New(
+		func(context.Context, string) bool {
+			allowCalls.Add(1)
+			return allowCalls.Load() > 2 // Allow after 2 failures
+		},
+	)
 	mc.Trigger(ctx, key, period)
 
 	// Wait long enough for multiple periods

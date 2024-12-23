@@ -1,4 +1,4 @@
-package tickqueue
+package fifo
 
 import (
 	"testing"
