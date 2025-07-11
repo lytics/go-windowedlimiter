@@ -59,7 +59,7 @@ func checkOrdering(t *testing.T, rb *Ring[int], expected []int) {
 	}
 	require.Equal(t, expected[0], n.Value)
 
-	for i := 0; i < len(expected); i++ {
+	for i := range expected {
 		next := rb.Next()
 		require.Equal(t, expected[i], next.Value, "Next() should return the correct entry")
 	}
@@ -67,7 +67,7 @@ func checkOrdering(t *testing.T, rb *Ring[int], expected []int) {
 
 func BenchmarkRegister(b *testing.B) {
 	rb := New[int]()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		rb.Register(i, nil)
 	}
 }
@@ -75,29 +75,29 @@ func BenchmarkRegister(b *testing.B) {
 func BenchmarkRemove(b *testing.B) {
 	rb := New[int]()
 	elements := make([]*Element[int], b.N)
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		elements[i] = rb.Register(i, nil)
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for i := 0; b.Loop(); i++ {
 		elements[i].Remove()
 	}
 }
 
 func BenchmarkNextEmpty(b *testing.B) {
 	rb := New[int]()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rb.Next()
 	}
 }
 
 func BenchmarkNext(b *testing.B) {
 	rb := New[int]()
-	for i := 0; i < 100; i++ { // Pre-populate with a reasonable number of elements
+	for i := range 100 { // Pre-populate with a reasonable number of elements
 		rb.Register(i, nil)
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		rb.Next()
 	}
 }
@@ -106,13 +106,11 @@ func BenchmarkRemoveWithCleanup(b *testing.B) {
 	rb := New[int]()
 	cleanup := func(int) error { return nil }
 	elements := make([]*Element[int], b.N)
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		elements[i] = rb.Register(i, cleanup)
 	}
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		elements[i].Remove()
 	}
 }

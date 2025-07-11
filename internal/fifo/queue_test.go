@@ -39,7 +39,7 @@ func TestPush(t *testing.T) {
 
 func BenchmarkPush(b *testing.B) {
 	rb := New[int]()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		rb.Push(i, nil)
 	}
 }
@@ -47,29 +47,29 @@ func BenchmarkPush(b *testing.B) {
 func BenchmarkRemove(b *testing.B) {
 	rb := New[int]()
 	elements := make([]*Element[int], b.N)
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		elements[i] = rb.Push(i, nil)
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for i := 0; b.Loop(); i++ {
 		elements[i].Remove()
 	}
 }
 
 func BenchmarkShiftEmpty(b *testing.B) {
 	rb := New[int]()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		rb.Shift()
 	}
 }
 
 func BenchmarkShift(b *testing.B) {
 	rb := New[int]()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		rb.Push(i, nil)
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		rb.Shift()
 	}
 }
@@ -78,13 +78,11 @@ func BenchmarkRemoveWithCleanup(b *testing.B) {
 	rb := New[int]()
 	cleanup := func(int) error { return nil }
 	elements := make([]*Element[int], b.N)
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		elements[i] = rb.Push(i, cleanup)
 	}
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		elements[i].Remove()
 	}
 }

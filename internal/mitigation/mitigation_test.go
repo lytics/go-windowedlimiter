@@ -117,7 +117,7 @@ func TestMitigate_MultipleWaiters(t *testing.T) {
 	// Create multiple goroutines waiting on the same mitigation
 	errs := make(chan error, num)
 	var wg sync.WaitGroup
-	for i := 0; i < num; i++ {
+	for i := range num {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -128,7 +128,7 @@ func TestMitigate_MultipleWaiters(t *testing.T) {
 	wg.Wait()
 
 	// Collect results
-	for i := 0; i < num; i++ {
+	for i := range num {
 		err := <-errs
 		if err != nil {
 			t.Errorf("Expected no error for waiter %d, got %v", i, err)

@@ -23,7 +23,7 @@ func TestBasic(t *testing.T) {
 	l, key := setup(t, ctx, rate, interval)
 
 	allowed := 0
-	for i := 0; i < 15; i++ {
+	for range 15 {
 		if l.Allow(ctx, key) {
 			time.Sleep(2 * time.Millisecond) // due to async incrementer
 			allowed++
@@ -35,7 +35,7 @@ func TestBasic(t *testing.T) {
 	l.Wait(ctx, key)
 	assert.WithinDuration(t, time.Now(), now, interval)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		now := time.Now()
 		l.Wait(ctx, key)
 		assert.WithinDuration(t, time.Now(), now, 11*time.Millisecond)
@@ -81,7 +81,7 @@ func TestConcurrent(t *testing.T) {
 		}
 	})
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		labels := pprof.Labels("name", "testWaiter")
 		go pprof.Do(ctx, labels, func(context.Context) {
