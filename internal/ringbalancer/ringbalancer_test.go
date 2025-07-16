@@ -42,16 +42,17 @@ func TestRegister(t *testing.T) {
 
 	checkOrdering(t, rb, []int{1, 2, 3, 4})
 
-	entry1.Remove()
+	require.NoError(t, entry1.Remove())
 	require.Equal(t, 2, rb.cur.Value, "Expected cur to be entry2")
 	checkOrdering(t, rb, []int{2, 3, 4})
 
-	entry4.Remove()
+	require.NoError(t, entry4.Remove())
 	require.Equal(t, 2, rb.cur.Value, "Expected cur to be entry2")
 	checkOrdering(t, rb, []int{2, 3})
 }
 
 func checkOrdering(t *testing.T, rb *Ring[int], expected []int) {
+	t.Helper()
 	n := rb.cur
 	for _, val := range expected {
 		require.Equal(t, val, n.Value)
@@ -80,7 +81,7 @@ func BenchmarkRemove(b *testing.B) {
 	}
 
 	for i := 0; b.Loop(); i++ {
-		elements[i].Remove()
+		require.NoError(b, elements[i].Remove())
 	}
 }
 
@@ -111,6 +112,6 @@ func BenchmarkRemoveWithCleanup(b *testing.B) {
 	}
 
 	for i := 0; b.Loop(); i++ {
-		elements[i].Remove()
+		require.NoError(b, elements[i].Remove())
 	}
 }

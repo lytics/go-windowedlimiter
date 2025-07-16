@@ -78,7 +78,7 @@ type Limiter struct {
 // Close stops all goroutines, flushes logging, and waits for completion.
 func (l *Limiter) Close() {
 	l.doneChan <- struct{}{}
-	l.logger.Sync()
+	_ = l.logger.Sync()
 	l.wg.Wait()
 }
 
@@ -183,7 +183,7 @@ func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 		portionOfLastInt := keyConf.Interval - curIntAgo
 		percentOfLastInt := float64(portionOfLastInt.Nanoseconds()) / float64(keyConf.Interval.Nanoseconds())
 		rawOfLastInt := int64(float64(prev) * percentOfLastInt)
-		rateEstimate := int64(rawOfLastInt) + curr
+		rateEstimate := rawOfLastInt + curr
 		if rateEstimate >= keyConf.Rate {
 			return false, nil
 		}
@@ -213,11 +213,9 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 	defer func() {
 		if err != nil {
 			logger.Error("checking redis", zap.Error(err))
-		} else {
-			if allowed {
-				// only increment if we didn't fail talking to redis
-				l.incrChan <- key
-			}
+		} else if allowed {
+			// only increment if we didn't fail talking to redis
+			l.incrChan <- key
 		}
 	}()
 	if l.mitigationCache.Allow(ctx, key) {

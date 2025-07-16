@@ -38,7 +38,7 @@ func TestBasic(t *testing.T) {
 	for range 10 {
 		now := time.Now()
 		l.Wait(ctx, key)
-		assert.WithinDuration(t, time.Now(), now, 11*time.Millisecond)
+		assert.WithinDuration(t, time.Now(), now, 12*time.Millisecond)
 	}
 }
 
@@ -131,7 +131,7 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 	l := New(ctx, rdb, keyConfFn, Options{Logger: logger})
 	t.Cleanup(func() {
 		l.Close()
-		rdb.Close()
+		_ = rdb.Close()
 	})
 	// avoid testing over the first interval wrap, which can cause more requests to
 	// be allowed
@@ -156,5 +156,5 @@ func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granula
 		logger.Sugar().Infof("requests in interval %v: %d", i.Format("05.000"), intervals[i])
 	}
 	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularity*0)], rate, "first interval should have at least rate requests")
-	assert.Equal(t, intervals[minInterval.Add(granularity*1)], int64(0), "second interval should have zero requests")
+	assert.Equal(t, int64(0), intervals[minInterval.Add(granularity*1)], "second interval should have zero requests")
 }

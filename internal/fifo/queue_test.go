@@ -29,11 +29,11 @@ func TestPush(t *testing.T) {
 	require.Equal(t, entry2, rb.cur, "last should point to newest entry")
 	require.Equal(t, entry4, rb.last, "last should point to newest entry")
 
-	entry3.Remove()
+	require.NoError(t, entry3.Remove())
 	require.Equal(t, entry2, rb.Shift(), "Shift() should return entry2")
 	require.Equal(t, entry4, rb.Shift(), "Shift() should return entry4")
 
-	entry4.Remove()
+	require.NoError(t, entry4.Remove())
 	require.Nil(t, rb.Shift(), "Shift() should return nil when empty")
 }
 
@@ -52,7 +52,7 @@ func BenchmarkRemove(b *testing.B) {
 	}
 
 	for i := 0; b.Loop(); i++ {
-		elements[i].Remove()
+		require.NoError(b, elements[i].Remove())
 	}
 }
 
@@ -83,6 +83,6 @@ func BenchmarkRemoveWithCleanup(b *testing.B) {
 	}
 
 	for i := 0; b.Loop(); i++ {
-		elements[i].Remove()
+		require.NoError(b, elements[i].Remove())
 	}
 }

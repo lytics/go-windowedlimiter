@@ -8,6 +8,7 @@ package mitigation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime/pprof"
 	"sync"
 	"time"
@@ -16,7 +17,7 @@ import (
 	"github.com/vitaminmoo/go-slidingwindow/internal/fifo"
 )
 
-var ttlMultiplier = time.Duration(3)
+var ttlMultiplier = 3
 
 type tick struct {
 	C    chan struct{}
@@ -60,13 +61,13 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 	m, ok := mc.cache.Load(key)
 	if ok {
 		m.mu.Lock()
-		m.ttl = time.Now().Add(ttlMultiplier * period)
+		m.ttl = time.Now().Add(time.Duration(ttlMultiplier) * period)
 		m.mu.Unlock()
 		return
 	}
 	m = &Mitigation{
 		period: period,
-		ttl:    time.Now().Add(ttlMultiplier * period),
+		ttl:    time.Now().Add(time.Duration(ttlMultiplier) * period),
 		until:  time.Now().Add(period),
 		q:      fifo.New[*tick](),
 		ctx:    ctx,
@@ -94,7 +95,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 					// there are still subscribers, extend the mitigation
 					// this is kinda incompatible with moving from Wait() to something
 					// more stateful
-					m.ttl = time.Now().Add(ttlMultiplier * m.period)
+					m.ttl = time.Now().Add(time.Duration(ttlMultiplier) * m.period)
 				}
 				if now.After(m.until) {
 					// the mitigation is ready to be re-evaluated
@@ -123,7 +124,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 							goto NEXT
 						}
 					} else {
-						m.ttl = now.Add(ttlMultiplier * m.period)
+						m.ttl = now.Add(time.Duration(ttlMultiplier) * m.period)
 						m.until = now.Add(m.period)
 					}
 				}
@@ -160,7 +161,10 @@ func (mc *MitigationCache) Wait(ctx context.Context, key string) error {
 	case <-t.Done:
 		return errors.New("done")
 	case <-t.C:
-		entry.Remove()
+		err := entry.Remove()
+		if err != nil {
+			return fmt.Errorf("removing entry from fifo: %w", err)
+		}
 		return nil
 	}
 }

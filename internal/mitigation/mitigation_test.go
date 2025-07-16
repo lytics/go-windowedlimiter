@@ -151,7 +151,7 @@ func TestMitigate_PeriodReset(t *testing.T) {
 	mc.Trigger(ctx, key, period)
 
 	// Wait long enough for multiple periods
-	time.Sleep(ttlMultiplier * period)
+	time.Sleep(time.Duration(ttlMultiplier) * period)
 
 	err := mc.Wait(ctx, key)
 	if err != nil {

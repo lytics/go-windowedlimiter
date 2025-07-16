@@ -1,0 +1,34 @@
+---
+exclude: ^vendor/
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0 # Use the ref you want to point at
+    hooks:
+      - id: trailing-whitespace
+        exclude: "^devops/jsonnet/vendor|^src/ext_svcs/postup/mock/data.go$"
+      - id: check-yaml
+        args:
+          - --allow-multiple-documents
+        files: '.*\.ya?ml$'
+      - id: check-added-large-files
+      - id: check-json
+        exclude: "invalid.json$"
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: detect-private-key
+        exclude: ^src/sysdata/models/auth_test.go$
+      - id: no-commit-to-branch
+        args:
+          - -b main
+  - repo: https://github.com/bhundven/golang-pre-commit
+    rev: v1.1.3
+    hooks:
+      - id: go-mod-tidy
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v2.2.2
+    hooks:
+      - id: golangci-lint-fmt
+      - id: golangci-lint
+
+default_stages: [pre-commit]
+default_install_hook_types: [pre-commit, pre-push]

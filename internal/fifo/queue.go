@@ -48,7 +48,7 @@ func (q *Queue[T]) Close() {
 	for cur := q.cur; cur != nil; cur = cur.next {
 		cur.removed = true
 		cur.next = nil
-		cur.cleanup(cur.Value)
+		_ = cur.cleanup(cur.Value)
 	}
 	q.cur = nil
 }

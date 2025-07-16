@@ -62,13 +62,13 @@ func (rb *Ring[T]) Close() {
 	}
 	if rb.cur.prev == nil {
 		// only one element
-		rb.cur.cleanup(rb.cur.Value)
+		_ = rb.cur.cleanup(rb.cur.Value)
 		rb.cur = nil
 		return
 	}
 	rb.cur.prev.next = nil
 	for cur := rb.cur; cur != nil; cur = cur.next {
-		cur.cleanup(cur.Value)
+		_ = cur.cleanup(cur.Value)
 	}
 	rb.cur = nil
 }

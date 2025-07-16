@@ -1,0 +1,61 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - bidichk
+    - bodyclose
+    - copyloopvar
+    - dupl
+    - durationcheck
+    - errcheck
+    - errchkjson
+    - errname
+    - exptostd
+    - fatcontext
+    - gocritic
+    - gosec
+    - govet
+    - importas
+    - ineffassign
+    - intrange
+    - loggercheck
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - prealloc
+    - predeclared
+    - promlinter
+    - spancheck
+    - staticcheck
+    - tagalign
+    - testifylint
+    - thelper
+    - unconvert
+    - unused
+    - usestdlibvars
+    - usetesting
+  settings:
+    dupl:
+      threshold: 500
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - dupl
+        path: _test.go
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+  whole-files: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
