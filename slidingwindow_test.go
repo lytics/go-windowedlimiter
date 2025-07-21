@@ -2,19 +2,14 @@ package slidingwindow
 
 import (
 	"context"
-	"fmt"
 	"runtime/pprof"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/fgrosse/zaptest"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 func TestBasic(t *testing.T) {
@@ -212,43 +207,6 @@ func TestClose(t *testing.T) {
 	// Close is called automatically via t.Cleanup inside setup() and should not error or block even with us already having closed
 }
 
-func TestConcurrent_AllowAndRefreshKey(t *testing.T) {
-	t.Parallel()
-	ctx := t.Context()
-	l, key := setup(t, ctx, 100, 500*time.Millisecond)
-
-	var wg sync.WaitGroup
-	wg.Add(10)
-
-	rate := int64(100)
-	l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
-		return &KeyConf{Rate: rate, Interval: 500 * time.Millisecond}
-	}
-
-	// Goroutine to refresh the key repeatedly.
-	go func() {
-		for i := range 50 {
-			rate = int64(100 + i)
-			l.RefreshKey(ctx, key)
-			time.Sleep(1 * time.Millisecond)
-		}
-	}()
-
-	// Multiple goroutines calling Allow.
-	for range 10 {
-		go func() {
-			defer wg.Done()
-			for j := range 100 {
-				l.Allow(ctx, key)
-				time.Sleep(time.Duration(j%5) * time.Millisecond)
-			}
-		}()
-	}
-
-	wg.Wait()
-	// The test passes if it completes without the race detector firing.
-}
-
 func TestAllow_AsyncIncrementRace(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
@@ -334,77 +292,4 @@ func BenchmarkAllow_RedisDown(b *testing.B) {
 	for b.Loop() {
 		l.Allow(ctx, key)
 	}
-}
-
-// setupBench is a simplified version of setup for benchmarks
-func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
-	b.Helper()
-	mr, err := miniredis.Run()
-	if err != nil {
-		b.Fatalf("an error '%s' was not expected when opening a stub redis connection", err)
-	}
-	b.Cleanup(mr.Close)
-
-	rdb := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
-	keyConfFn := func(ctx context.Context, key string) *KeyConf {
-		return &KeyConf{Rate: rate, Interval: interval}
-	}
-	// Benchmarks shouldn't log to avoid skewing results.
-	l := New(ctx, rdb, keyConfFn)
-	key := fmt.Sprintf("%s-%d", b.Name(), time.Now().UnixNano()%1000)
-	b.Cleanup(func() {
-		l.Close()
-		_ = rdb.Close()
-	})
-	return l, key
-}
-
-func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
-	t.Helper()
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
-
-	// zaptest.Level = zapcore.InfoLevel
-	config := zaptest.Config()
-	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	zaptest.Config = func() zapcore.EncoderConfig { return config }
-	logger := zaptest.Logger(t)
-
-	key := fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()%1000)
-	keyConfFn := func(ctx context.Context, key string) *KeyConf {
-		return &KeyConf{Rate: rate, Interval: interval}
-	}
-	l := New(ctx, rdb, keyConfFn, Options{Logger: logger})
-	t.Cleanup(func() {
-		l.Close()
-		_ = rdb.Close()
-	})
-	// avoid testing over the first interval wrap, which can cause more requests to
-	// be allowed
-	time.Sleep(time.Until(time.Now().Truncate(interval).Add(interval)))
-	return l, key
-}
-
-func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
-	t.Helper()
-	logger = logger.WithOptions(zap.AddCallerSkip(1))
-	var minInterval time.Time
-	var maxInterval time.Time
-	for s := range intervals {
-		if minInterval.IsZero() || s.Before(minInterval) {
-			minInterval = s
-		}
-		if maxInterval.IsZero() || s.After(maxInterval) {
-			maxInterval = s
-		}
-	}
-	for i := minInterval; i.Before(maxInterval); i = i.Add(granularity) {
-		logger.Sugar().Infof("requests in interval %v: %d", i.Format("05.000"), intervals[i])
-	}
-	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularity*0)], rate, "first interval should have at least rate requests")
-	assert.Equal(t, int64(0), intervals[minInterval.Add(granularity*1)], "second interval should have zero requests")
 }

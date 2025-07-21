@@ -12,7 +12,6 @@ import (
 	"github.com/puzpuzpuz/xsync"
 	"github.com/redis/go-redis/v9"
 	"github.com/vitaminmoo/go-slidingwindow/internal/mitigation"
-	"github.com/yuseferi/zax/v2"
 	"go.uber.org/zap"
 )
 
@@ -93,6 +92,15 @@ func (l *Limiter) Close() {
 	_ = l.logger.Sync()
 }
 
+// SetKeyConfFn sets the KeyConfFn on the limiter and clears all mitigations
+func (l *Limiter) SetKeyConfFn(ctx context.Context, keyConfFn func(ctx context.Context, key string) *KeyConf) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logger.Info("setting new key configuration function")
+	l.keyConfFn = keyConfFn
+	l.Refresh(ctx)
+}
+
 // Refresh causes the KeyConfFn to be called again for all keys (lazily).
 //
 // If your rate limit is changing globally, you should call this once the keyConfFn is returning the new result
@@ -109,7 +117,8 @@ func (l *Limiter) Refresh(ctx context.Context) {
 //
 // If your rate limit is changing for a specific key, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) RefreshKey(ctx context.Context, key string) {
-	l.logger.Info("refreshing key configuration", zap.String("key", key))
+	logger := l.logger.With(keyField(key))
+	logger.Info("refreshing key configuration")
 	l.keyConfCache.Delete(key)
 	// for now we just naively nuke any mitigation currently in place and assume it will come back at the new limits if it needs to
 	l.mitigationCache.Close(key)
@@ -126,7 +135,6 @@ func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 }
 
 func (l *Limiter) incrementer(ctx context.Context) {
-	logger := l.logger.With(zax.Get(ctx)...)
 	l.wg.Done()
 
 	keysToIncr := make(map[string]int64)
@@ -136,11 +144,11 @@ func (l *Limiter) incrementer(ctx context.Context) {
 	for {
 		select {
 		case <-l.doneChan:
-			logger.Debug("incrementer stopping via Close(), processing final batch")
+			l.logger.Debug("incrementer stopping via Close(), processing final batch")
 			l.processIncrBatch(ctx, keysToIncr)
 			return
 		case <-ctx.Done():
-			logger.Debug("incrementer stopping via context cancellation, processing final batch")
+			l.logger.Debug("incrementer stopping via context cancellation, processing final batch")
 			l.processIncrBatch(ctx, keysToIncr)
 			return
 		case key := <-l.incrChan:
@@ -163,14 +171,13 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 	if len(batch) == 0 {
 		return
 	}
-	logger := l.logger.With(zax.Get(ctx)...)
 
 	l.mu.RLock()
 	rdb := l.rdb
 	l.mu.RUnlock()
 
 	if rdb == nil {
-		logger.Error("redis client is nil, skipping batch processing")
+		l.logger.Error("redis client is nil, skipping batch processing")
 		return
 	}
 
@@ -188,13 +195,13 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 
 	_, err := pipe.Exec(ctx)
 	if err != nil && !errors.Is(err, redis.ErrClosed) {
-		logger.Error("error executing increment pipeline", zap.Error(err))
+		l.logger.Error("error executing increment pipeline", zap.Error(err))
 	}
 
 	for key, cmd := range cmds {
 		res, err := cmd.Result()
 		if err != nil && !errors.Is(err, redis.ErrClosed) {
-			logger.Error("error incrementing key in pipeline", zap.String("key", key), zap.Error(err))
+			l.logger.Error("error incrementing key in pipeline", zap.String("key", key), zap.Error(err))
 			continue
 		}
 		keyConf := l.keyConf(ctx, key)
@@ -205,7 +212,7 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 }
 
 func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
-	logger := l.logger.With(zax.Get(ctx)...)
+	logger := l.logger.With(keyField(key))
 
 	l.mu.RLock()
 	rdb := l.rdb
@@ -251,7 +258,7 @@ func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 }
 
 func (l *Limiter) mitigate(ctx context.Context, key string) {
-	logger := l.logger.With(zax.Get(ctx)...)
+	logger := l.logger.With(keyField(key))
 	keyConf := l.keyConf(ctx, key)
 	period := time.Duration(keyConf.Interval.Nanoseconds() / keyConf.Rate)
 	logger.Debug("mitigating", zap.Duration("period", period))
@@ -259,7 +266,6 @@ func (l *Limiter) mitigate(ctx context.Context, key string) {
 }
 
 func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool) {
-	ctx = zax.Set(ctx, []zap.Field{zap.String("key", key)})
 	pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
 		allowed = l.allow(ctx, key)
 	})
@@ -267,7 +273,7 @@ func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool) {
 }
 
 func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
-	logger := l.logger.With(zax.Get(ctx)...)
+	logger := l.logger.With(keyField(key))
 	var err error
 	defer func() {
 		if err != nil {
@@ -293,14 +299,13 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 }
 
 func (l *Limiter) Wait(ctx context.Context, key string) {
-	ctx = zax.Set(ctx, []zap.Field{zap.String("key", key)})
 	pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
 		l.wait(ctx, key)
 	})
 }
 
 func (l *Limiter) wait(ctx context.Context, key string) {
-	logger := l.logger.With(zax.Get(ctx)...)
+	logger := l.logger.With(keyField(key))
 	for retries := 0; ; retries++ { // TODO: exponential backoff, and maybe a retry limit?
 		err := l.mitigationCache.Wait(ctx, key)
 		if err == nil {
@@ -319,4 +324,8 @@ func (l *Limiter) wait(ctx context.Context, key string) {
 			return
 		}
 	}
+}
+
+func keyField(key string) zap.Field {
+	return zap.String("slidingwindow/key", key)
 }
