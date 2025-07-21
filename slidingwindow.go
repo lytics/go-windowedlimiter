@@ -24,8 +24,7 @@ type KeyConf struct {
 
 // Options is a set of options for creating a new Limiter
 type Options struct {
-	Logger     *zap.Logger // The zap logger to use for logging. Will default to not logging anything
-	FailClosed bool        // Whether or not to deny requests/block if the limiter is unable to determine if a request should be allowed. Note that due to the mitigation cache, this currently only has any effect when a key is already in the mitigation cache
+	Logger *zap.Logger // The zap logger to use for logging. Will default to not logging anything
 }
 
 // New creates a new Limiter with the provided Redis client and options
@@ -42,20 +41,15 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 		keyConfFn:    keyConfFn,
 		incrChan:     make(chan string, 1000),
 		doneChan:     make(chan struct{}),
-		failClosed:   false,
 	}
 	if len(options) > 0 {
 		l.logger = options[0].Logger
-		l.failClosed = options[0].FailClosed
 	}
 	allow := func(ctx context.Context, key string) bool {
 		allowed, err := l.checkRedis(ctx, key)
 		if err != nil {
 			l.logger.Debug("failed to check redis for mitigation status", zap.Error(err))
-			l.mu.RLock()
-			failClosed := l.failClosed
-			l.mu.RUnlock()
-			return !failClosed
+			return true // if we can't check redis, we assume the key is allowed
 		}
 		return allowed
 	}
@@ -76,14 +70,6 @@ type Limiter struct {
 	incrChan        chan string
 	doneChan        chan struct{}
 	wg              sync.WaitGroup
-	failClosed      bool
-}
-
-// SetFailClosed sets the fail-closed flag on the limiter. This is thread-safe.
-func (l *Limiter) SetFailClosed(failClosed bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.failClosed = failClosed
 }
 
 // SetRDB sets the redis client on the limiter. This is thread-safe.
@@ -290,10 +276,7 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 	logger.Debug("checked by redis", zap.Bool("allowed", allowed), zap.Error(err))
 	if err != nil {
 		logger.Debug("failed to check redis for rate", zap.Error(err))
-		l.mu.RLock()
-		failClosed := l.failClosed
-		l.mu.RUnlock()
-		return !failClosed
+		return true // if we can't check redis, we assume the key is allowed
 	}
 	return allowed
 }
