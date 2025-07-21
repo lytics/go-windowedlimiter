@@ -31,6 +31,7 @@ type Mitigation struct {
 	until    time.Time          // when the mitigation will be re-evaluated
 	q        *fifo.Queue[*tick] // the queue for the mitigation
 	ctx      context.Context    // context for cancellation of the mitigation garbage collector goroutine
+	done     chan struct{}      // done is closed to signal the mitigation should be shut down
 	mu       sync.Mutex         // mutex for the mitigation
 	allowOne bool               // if false, first allowed request toggles this for the next Allow() call to consume
 }
@@ -46,6 +47,15 @@ func New(allowFn func(context.Context, string) bool) *MitigationCache {
 type MitigationCache struct {
 	cache   *xsync.MapOf[string, *Mitigation]
 	allowFn func(ctx context.Context, key string) bool
+}
+
+// Close cleans up all active mitigations, stopping their goroutines.
+func (mc *MitigationCache) Close() {
+	mc.cache.Range(func(key string, m *Mitigation) bool {
+		close(m.done)
+		mc.cache.Delete(key)
+		return true
+	})
 }
 
 // Trigger creates a new mitigation or refreshes an existing one's ttl
@@ -71,15 +81,19 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 		until:  time.Now().Add(period),
 		q:      fifo.New[*tick](),
 		ctx:    ctx,
+		done:   make(chan struct{}),
 	}
 	mc.cache.Store(key, m)
 
 	go pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
+		defer m.q.Close()
 	TICK:
 		for {
 			select {
+			case <-m.done:
+				return
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
@@ -97,36 +111,45 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 					// more stateful
 					m.ttl = time.Now().Add(time.Duration(ttlMultiplier) * m.period)
 				}
-				if now.After(m.until) {
-					// the mitigation is ready to be re-evaluated
-					if mc.allowFn(ctx, key) {
-					NEXT:
-						if !m.allowOne {
-							// feed first allowed request to any realtime Allow() that happens
-							m.allowOne = true
-							m.mu.Unlock()
-							continue TICK
-						}
-						next := m.q.Shift()
-						if next == nil {
-							// empty ring, can't send to anyone
-							m.mu.Unlock()
-							continue TICK
-						}
-						select {
-						case next.Value.C <- struct{}{}:
-						default:
-							// no listener on the blocking channel, remove it from the ring
-							err := next.Remove()
-							if err != nil {
-								panic(err)
-							}
-							goto NEXT
-						}
-					} else {
-						m.ttl = now.Add(time.Duration(ttlMultiplier) * m.period)
-						m.until = now.Add(m.period)
+				shouldReevaluate := now.After(m.until)
+				m.mu.Unlock() // Unlock before the expensive/blocking call
+
+				if !shouldReevaluate {
+					continue TICK
+				}
+
+				allowed := mc.allowFn(ctx, key)
+
+				m.mu.Lock() // Re-lock to safely update mitigation state
+				if allowed {
+				NEXT:
+					if !m.allowOne {
+						// feed first allowed request to any realtime Allow() that happens
+						m.allowOne = true
+						m.mu.Unlock()
+						continue TICK
 					}
+					next := m.q.Shift()
+					if next == nil {
+						// empty ring, can't send to anyone
+						m.mu.Unlock()
+						continue TICK
+					}
+					select {
+					case next.Value.C <- struct{}{}:
+					default:
+						// no listener on the blocking channel, remove it from the ring
+						err := next.Remove()
+						if err != nil {
+							panic(err)
+						}
+						goto NEXT
+					}
+				} else {
+					// Not allowed, so reset the ttl/until timers
+					now := time.Now()
+					m.ttl = now.Add(time.Duration(ttlMultiplier) * m.period)
+					m.until = now.Add(m.period)
 				}
 				m.mu.Unlock()
 			}

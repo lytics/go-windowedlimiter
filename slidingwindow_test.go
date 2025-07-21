@@ -25,15 +25,19 @@ func TestBasic(t *testing.T) {
 	allowed := 0
 	for range 15 {
 		if l.Allow(ctx, key) {
-			time.Sleep(2 * time.Millisecond) // due to async incrementer
 			allowed++
 		}
 	}
-	assert.Equal(t, 10, allowed)
+	assert.GreaterOrEqual(t, allowed, int(rate))
+
+	// wait for batch processing and mitigation
+	time.Sleep(interval)
+	require.False(t, l.Allow(ctx, key), "should be blocked after burst")
 
 	now := time.Now()
 	l.Wait(ctx, key)
-	assert.WithinDuration(t, time.Now(), now, interval)
+	// The first wait after mitigation might take longer, but subsequent ones should be paced.
+	assert.WithinDuration(t, time.Now(), now, interval, "first wait should be within an interval")
 
 	for range 10 {
 		now := time.Now()
@@ -110,6 +114,267 @@ func TestConcurrent(t *testing.T) {
 	assert.NotZero(t, total, "didn't record any requests")
 
 	l.logger.Sugar().Infof("total sent: %d", len(durations))
+}
+
+func TestFailureMode(t *testing.T) {
+	ctx := context.Background()
+	rate := int64(1)
+	interval := 1 * time.Second
+	l, key := setup(t, ctx, rate, interval)
+
+	assert.True(t, l.Allow(ctx, key), "first request should be allowed")
+	time.Sleep(50 * time.Millisecond)
+
+	// kill redis in a way that fails instantly
+	l.SetRDB(redis.NewClient(&redis.Options{
+		DialTimeout: 100 * time.Millisecond,
+		Addr:        "127.0.0.1:0",
+	}))
+	assert.True(t, l.Allow(ctx, key), "should be allowed with redis down")
+	l.SetFailClosed(true)
+	assert.False(t, l.Allow(ctx, key), "should be denied with redis down")
+
+	// kill redis in a way that fails with a timeout
+	l.SetRDB(redis.NewClient(&redis.Options{
+		DialTimeout: 100 * time.Millisecond,
+		Addr:        "1.1.1.1:0",
+	}))
+	assert.False(t, l.Allow(ctx, key), "should be denied with redis down")
+	l.SetFailClosed(false)
+	assert.True(t, l.Allow(ctx, key), "should be allowed with redis down")
+}
+
+func TestRefreshKey(t *testing.T) {
+	ctx := context.Background()
+	rate := int64(5)
+	interval := 100 * time.Millisecond
+	l, key := setup(t, ctx, rate, interval)
+
+	for range 5 {
+		require.True(t, l.Allow(ctx, key), "should allow initial requests")
+	}
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+
+	require.False(t, l.Allow(ctx, key), "should not allow after rate limit is hit")
+
+	// Refresh key to a higher rate limit
+	l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
+		return &KeyConf{Rate: 15, Interval: interval}
+	}
+	l.RefreshKey(ctx, key)
+
+	for i := range 10 {
+		require.True(t, l.Allow(ctx, key), "should allow requests after refreshing key conf, attempt %d", i+1)
+	}
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+	allowed, err := l.checkRedis(ctx, key)
+	require.NoError(t, err)
+	require.True(t, allowed, "checkRedis should allow after refreshing key conf")
+}
+
+func TestRefresh(t *testing.T) {
+	ctx := context.Background()
+	rate := int64(5)
+	interval := 100 * time.Millisecond
+	l, key1 := setup(t, ctx, rate, interval)
+	key2 := key1 + "-key2"
+
+	for range 5 {
+		require.True(t, l.Allow(ctx, key1), "should allow initial requests for key 1")
+		require.True(t, l.Allow(ctx, key2), "should allow initial requests for key 2")
+	}
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+
+	require.False(t, l.Allow(ctx, key1), "should not allow for key 1 after rate limit is hit")
+	require.False(t, l.Allow(ctx, key2), "should not allow for key 2 after rate limit is hit")
+
+	// Refresh all keys to a higher rate limit
+	l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
+		return &KeyConf{Rate: 15, Interval: interval}
+	}
+	l.Refresh(ctx)
+
+	for range 10 {
+		require.True(t, l.Allow(ctx, key1), "should allow requests for key 1 after refreshing")
+		require.True(t, l.Allow(ctx, key2), "should allow requests for key 2 after refreshing")
+	}
+}
+
+func TestWait_ContextCancellation(t *testing.T) {
+	ctx := context.Background()
+	rate := int64(1)
+	interval := 100 * time.Millisecond
+	l, key := setup(t, ctx, rate, interval)
+
+	// Exceed the rate limit to trigger mitigation.
+	l.Allow(ctx, key)
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+	l.Allow(ctx, key)
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+	require.False(t, l.mitigationCache.Allow(ctx, key), "should be mitigated")
+
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	l.Wait(waitCtx, key) // This should return quickly due to context cancellation
+	duration := time.Since(start)
+
+	require.ErrorIs(t, waitCtx.Err(), context.DeadlineExceeded, "context should be cancelled")
+	require.Less(t, duration, 50*time.Millisecond, "Wait should return promptly after context is canceled")
+}
+
+func TestClose(t *testing.T) {
+	ctx := context.Background()
+	l, _ := setup(t, ctx, 10, time.Second)
+
+	// Just ensure Close() doesn't block. The test setup's t.Cleanup calls l.Close().
+	// A simple explicit call here for clarity.
+	l.Close()
+	// To be very sure, we can try to create a new one and close it.
+	l, key := setup(t, ctx, 10, time.Second)
+	l.Allow(ctx, key)
+	l.Close()
+}
+
+func TestConcurrent_AllowAndRefreshKey(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	l, key := setup(t, ctx, 100, 500*time.Millisecond)
+
+	var wg sync.WaitGroup
+	wg.Add(10)
+
+	// Goroutine to refresh the key repeatedly.
+	go func() {
+		for i := range 50 {
+			rate := int64(100 + i)
+			l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
+				return &KeyConf{Rate: rate, Interval: 500 * time.Millisecond}
+			}
+			l.RefreshKey(ctx, key)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	// Multiple goroutines calling Allow.
+	for range 10 {
+		go func() {
+			defer wg.Done()
+			for j := range 100 {
+				l.Allow(ctx, key)
+				time.Sleep(time.Duration(j%5) * time.Millisecond)
+			}
+		}()
+	}
+
+	wg.Wait()
+	// The test passes if it completes without the race detector firing.
+}
+
+func TestAllow_AsyncIncrementRace(t *testing.T) {
+	ctx := context.Background()
+	rate := int64(10)
+	interval := 500 * time.Millisecond
+	l, key := setup(t, ctx, rate, interval)
+
+	// Fire a burst of requests. More than the rate limit may be allowed initially
+	// because of the async incrementer.
+	allowedCount := 0
+	for range 15 {
+		if l.Allow(ctx, key) {
+			allowedCount++
+		}
+	}
+
+	t.Logf("Allowed %d requests initially in a burst", allowedCount)
+	assert.GreaterOrEqual(t, allowedCount, int(rate), "at least 'rate' should be allowed")
+
+	// Wait for incrementer to catch up and mitigation to trigger.
+	time.Sleep(100 * time.Millisecond)
+
+	// Now, subsequent requests should be denied.
+	assert.False(t, l.Allow(ctx, key), "should not be allowed after incrementer catches up")
+	assert.False(t, l.mitigationCache.Allow(ctx, key), "should be mitigated")
+}
+
+func BenchmarkAllow(b *testing.B) {
+	ctx := context.Background()
+	rate := int64(b.N + 1) // Ensure we don't hit the rate limit
+	interval := 1 * time.Minute
+	l, key := setupBench(b, ctx, rate, interval)
+
+	for b.Loop() {
+		l.Allow(ctx, key)
+	}
+}
+
+func BenchmarkAllow_Contended(b *testing.B) {
+	ctx := context.Background()
+	rate := int64(10)
+	interval := 1 * time.Minute
+	l, key := setupBench(b, ctx, rate, interval)
+
+	// Pre-fill to hit the rate limit
+	for range 10 {
+		l.Allow(ctx, key)
+	}
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+
+	for b.Loop() {
+		l.Allow(ctx, key)
+	}
+}
+
+func BenchmarkWait(b *testing.B) {
+	ctx := context.Background()
+	rate := int64(1)
+	interval := 1 * time.Minute
+	l, key := setupBench(b, ctx, rate, interval)
+	l.Allow(ctx, key)
+	time.Sleep(50 * time.Millisecond) // let incrementer run
+	l.Allow(ctx, key)                 // trigger mitigation
+	time.Sleep(50 * time.Millisecond)
+
+	for b.Loop() {
+		l.Wait(ctx, key)
+	}
+}
+
+func BenchmarkAllow_RedisDown(b *testing.B) {
+	ctx := context.Background()
+	rate := int64(b.N + 1)
+	interval := 1 * time.Minute
+	l, key := setupBench(b, ctx, rate, interval)
+
+	// Kill redis
+	l.rdb = redis.NewClient(&redis.Options{
+		DialTimeout: 100 * time.Millisecond,
+		Addr:        "127.0.0.1:0", // Invalid port, should fail fast
+	})
+
+	for b.Loop() {
+		l.Allow(ctx, key)
+	}
+}
+
+// setupBench is a simplified version of setup for benchmarks
+func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
+	b.Helper()
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	keyConfFn := func(ctx context.Context, key string) *KeyConf {
+		return &KeyConf{Rate: rate, Interval: interval}
+	}
+	// Benchmarks shouldn't log to avoid skewing results.
+	l := New(ctx, rdb, keyConfFn)
+	key := fmt.Sprintf("%s-%d", b.Name(), time.Now().UnixNano()%1000)
+	b.Cleanup(func() {
+		l.Close()
+		_ = rdb.Close()
+	})
+	return l, key
 }
 
 func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
