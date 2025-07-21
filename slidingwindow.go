@@ -81,6 +81,8 @@ func (l *Limiter) SetRDB(rdb redis.Cmdable) {
 
 // Close stops all goroutines, flushes logging, and waits for completion.
 func (l *Limiter) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.mitigationCache.CloseAll()
 	select {
 	case l.doneChan <- struct{}{}:

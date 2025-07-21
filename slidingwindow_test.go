@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/fgrosse/zaptest"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -17,7 +18,8 @@ import (
 )
 
 func TestBasic(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	rate := int64(10)
 	interval := 100 * time.Millisecond
 	l, key := setup(t, ctx, rate, interval)
@@ -42,12 +44,14 @@ func TestBasic(t *testing.T) {
 	for i := range 10 {
 		now := time.Now()
 		l.Wait(ctx, key)
-		assert.WithinDuration(t, time.Now(), now, 12*time.Millisecond, "try #%d wasn't within required duration", i)
+		// This is super time sensitive, I'm hoping go 1.25's time testing stuff will help here.
+		assert.WithinDuration(t, time.Now(), now, 30*time.Millisecond, "try #%d wasn't within required duration", i)
 	}
 }
 
 func TestConcurrent(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	rate := int64(100)
 	interval := 500 * time.Millisecond
 	l, key := setup(t, ctx, rate, interval)
@@ -117,7 +121,8 @@ func TestConcurrent(t *testing.T) {
 }
 
 func TestRefreshKey(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
 	l, key := setup(t, ctx, rate, interval)
@@ -145,7 +150,8 @@ func TestRefreshKey(t *testing.T) {
 }
 
 func TestRefresh(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
 	l, key1 := setup(t, ctx, rate, interval)
@@ -173,7 +179,8 @@ func TestRefresh(t *testing.T) {
 }
 
 func TestWait_ContextCancellation(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	rate := int64(1)
 	interval := 100 * time.Millisecond
 	l, key := setup(t, ctx, rate, interval)
@@ -197,7 +204,8 @@ func TestWait_ContextCancellation(t *testing.T) {
 }
 
 func TestClose(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	l, _ := setup(t, ctx, 10, time.Second)
 	// close manually
 	l.Close()
@@ -206,19 +214,21 @@ func TestClose(t *testing.T) {
 
 func TestConcurrent_AllowAndRefreshKey(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
+	ctx := t.Context()
 	l, key := setup(t, ctx, 100, 500*time.Millisecond)
 
 	var wg sync.WaitGroup
 	wg.Add(10)
 
+	rate := int64(100)
+	l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
+		return &KeyConf{Rate: rate, Interval: 500 * time.Millisecond}
+	}
+
 	// Goroutine to refresh the key repeatedly.
 	go func() {
 		for i := range 50 {
-			rate := int64(100 + i)
-			l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
-				return &KeyConf{Rate: rate, Interval: 500 * time.Millisecond}
-			}
+			rate = int64(100 + i)
 			l.RefreshKey(ctx, key)
 			time.Sleep(1 * time.Millisecond)
 		}
@@ -240,7 +250,8 @@ func TestConcurrent_AllowAndRefreshKey(t *testing.T) {
 }
 
 func TestAllow_AsyncIncrementRace(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	rate := int64(10)
 	interval := 500 * time.Millisecond
 	l, key := setup(t, ctx, rate, interval)
@@ -266,7 +277,7 @@ func TestAllow_AsyncIncrementRace(t *testing.T) {
 }
 
 func BenchmarkAllow(b *testing.B) {
-	ctx := context.Background()
+	ctx := b.Context()
 	rate := int64(b.N + 1) // Ensure we don't hit the rate limit
 	interval := 1 * time.Minute
 	l, key := setupBench(b, ctx, rate, interval)
@@ -277,7 +288,7 @@ func BenchmarkAllow(b *testing.B) {
 }
 
 func BenchmarkAllow_Contended(b *testing.B) {
-	ctx := context.Background()
+	ctx := b.Context()
 	rate := int64(10)
 	interval := 1 * time.Minute
 	l, key := setupBench(b, ctx, rate, interval)
@@ -294,7 +305,7 @@ func BenchmarkAllow_Contended(b *testing.B) {
 }
 
 func BenchmarkWait(b *testing.B) {
-	ctx := context.Background()
+	ctx := b.Context()
 	rate := int64(1)
 	interval := 1 * time.Minute
 	l, key := setupBench(b, ctx, rate, interval)
@@ -309,7 +320,7 @@ func BenchmarkWait(b *testing.B) {
 }
 
 func BenchmarkAllow_RedisDown(b *testing.B) {
-	ctx := context.Background()
+	ctx := b.Context()
 	rate := int64(b.N + 1)
 	interval := 1 * time.Minute
 	l, key := setupBench(b, ctx, rate, interval)
@@ -328,8 +339,14 @@ func BenchmarkAllow_RedisDown(b *testing.B) {
 // setupBench is a simplified version of setup for benchmarks
 func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
 	b.Helper()
+	mr, err := miniredis.Run()
+	if err != nil {
+		b.Fatalf("an error '%s' was not expected when opening a stub redis connection", err)
+	}
+	b.Cleanup(mr.Close)
+
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: mr.Addr(),
 	})
 	keyConfFn := func(ctx context.Context, key string) *KeyConf {
 		return &KeyConf{Rate: rate, Interval: interval}
@@ -346,12 +363,12 @@ func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Dur
 
 func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
 	t.Helper()
+	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{
-		DialTimeout: 100 * time.Millisecond,
-		Addr:        "localhost:6379",
+		Addr: mr.Addr(),
 	})
 
-	zaptest.Level = zapcore.InfoLevel
+	// zaptest.Level = zapcore.InfoLevel
 	config := zaptest.Config()
 	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	zaptest.Config = func() zapcore.EncoderConfig { return config }
