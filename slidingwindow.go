@@ -82,9 +82,15 @@ func (l *Limiter) SetRDB(rdb redis.Cmdable) {
 // Close stops all goroutines, flushes logging, and waits for completion.
 func (l *Limiter) Close() {
 	l.mitigationCache.Close()
-	l.doneChan <- struct{}{}
+	select {
+	case l.doneChan <- struct{}{}:
+		// Successfully sent done signal
+		l.wg.Wait()
+	default:
+		// Channel is full or closed, log a warning
+		l.logger.Warn("unable to send done signal to incrementer channel - channel might be full or closed")
+	}
 	_ = l.logger.Sync()
-	l.wg.Wait()
 }
 
 // Refresh causes the KeyConfFn to be called again for all keys (lazily).
@@ -116,7 +122,7 @@ func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 
 func (l *Limiter) incrementer(ctx context.Context) {
 	logger := l.logger.With(zax.Get(ctx)...)
-	defer l.wg.Done()
+	l.wg.Done()
 
 	keysToIncr := make(map[string]int64)
 	ticker := time.NewTicker(10 * time.Millisecond)

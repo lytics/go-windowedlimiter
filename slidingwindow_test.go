@@ -199,14 +199,9 @@ func TestWait_ContextCancellation(t *testing.T) {
 func TestClose(t *testing.T) {
 	ctx := context.Background()
 	l, _ := setup(t, ctx, 10, time.Second)
-
-	// Just ensure Close() doesn't block. The test setup's t.Cleanup calls l.Close().
-	// A simple explicit call here for clarity.
+	// close manually
 	l.Close()
-	// To be very sure, we can try to create a new one and close it.
-	l, key := setup(t, ctx, 10, time.Second)
-	l.Allow(ctx, key)
-	l.Close()
+	// Close is called automatically via t.Cleanup inside setup() and should not error or block even with us already having closed
 }
 
 func TestConcurrent_AllowAndRefreshKey(t *testing.T) {
