@@ -39,10 +39,10 @@ func TestBasic(t *testing.T) {
 	// The first wait after mitigation might take longer, but subsequent ones should be paced.
 	assert.WithinDuration(t, time.Now(), now, interval, "first wait should be within an interval")
 
-	for range 10 {
+	for i := range 10 {
 		now := time.Now()
 		l.Wait(ctx, key)
-		assert.WithinDuration(t, time.Now(), now, 12*time.Millisecond)
+		assert.WithinDuration(t, time.Now(), now, 12*time.Millisecond, "try #%d wasn't within required duration", i)
 	}
 }
 
@@ -351,6 +351,7 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 		Addr:        "localhost:6379",
 	})
 
+	zaptest.Level = zapcore.InfoLevel
 	config := zaptest.Config()
 	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	zaptest.Config = func() zapcore.EncoderConfig { return config }

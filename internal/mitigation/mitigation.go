@@ -49,13 +49,22 @@ type MitigationCache struct {
 	allowFn func(ctx context.Context, key string) bool
 }
 
-// Close cleans up all active mitigations, stopping their goroutines.
-func (mc *MitigationCache) Close() {
+// CloseAll cleans up all active mitigations, stopping their goroutines.
+func (mc *MitigationCache) CloseAll() {
 	mc.cache.Range(func(key string, m *Mitigation) bool {
 		close(m.done)
 		mc.cache.Delete(key)
 		return true
 	})
+}
+
+// Close removes a specific mitigation from the cache and stops its goroutine.
+func (mc *MitigationCache) Close(key string) {
+	m, ok := mc.cache.LoadAndDelete(key)
+	if !ok {
+		return
+	}
+	close(m.done)
 }
 
 // Trigger creates a new mitigation or refreshes an existing one's ttl

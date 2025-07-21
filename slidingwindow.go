@@ -39,7 +39,7 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 		// TODO: expire keyConfCache entries
 		keyConfCache: xsync.NewMapOf[*KeyConf](),
 		keyConfFn:    keyConfFn,
-		incrChan:     make(chan string, 1000),
+		incrChan:     make(chan string, 10),
 		doneChan:     make(chan struct{}),
 	}
 	if len(options) > 0 {
@@ -81,14 +81,12 @@ func (l *Limiter) SetRDB(rdb redis.Cmdable) {
 
 // Close stops all goroutines, flushes logging, and waits for completion.
 func (l *Limiter) Close() {
-	l.mitigationCache.Close()
+	l.mitigationCache.CloseAll()
 	select {
 	case l.doneChan <- struct{}{}:
 		// Successfully sent done signal
 		l.wg.Wait()
 	default:
-		// Channel is full or closed, log a warning
-		l.logger.Warn("unable to send done signal to incrementer channel - channel might be full or closed")
 	}
 	_ = l.logger.Sync()
 }
@@ -97,17 +95,22 @@ func (l *Limiter) Close() {
 //
 // If your rate limit is changing globally, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) Refresh(ctx context.Context) {
+	l.logger.Info("refreshing all key configurations")
 	l.keyConfCache.Range(func(key string, _ *KeyConf) bool {
 		l.keyConfCache.Delete(key)
 		return true
 	})
+	l.mitigationCache.CloseAll()
 }
 
 // RefreshKey causes the KeyConfFn to be called again for the specified key (lazily).
 //
 // If your rate limit is changing for a specific key, you should call this once the keyConfFn is returning the new result
 func (l *Limiter) RefreshKey(ctx context.Context, key string) {
+	l.logger.Info("refreshing key configuration", zap.String("key", key))
 	l.keyConfCache.Delete(key)
+	// for now we just naively nuke any mitigation currently in place and assume it will come back at the new limits if it needs to
+	l.mitigationCache.Close(key)
 }
 
 // keyConf returns the KeyConf for a given key, calling the KeyConfFn if it hasn't been called for this key yet
@@ -273,9 +276,9 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 		}
 	}()
 
-	if !l.mitigationCache.Allow(ctx, key) {
-		logger.Debug("blocked by mitigation")
-		return false
+	if l.mitigationCache.Allow(ctx, key) {
+		logger.Debug("allowed by mitigation")
+		return true
 	}
 
 	allowed, err = l.checkRedis(ctx, key)
