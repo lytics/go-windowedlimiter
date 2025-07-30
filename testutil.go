@@ -40,7 +40,7 @@ func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Dur
 	return l, key
 }
 
-func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
+func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*miniredis.Miniredis, *Limiter, string) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{
@@ -51,7 +51,7 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 	keyConfFn := func(ctx context.Context, key string) *KeyConf {
 		return &KeyConf{Rate: rate, Interval: interval}
 	}
-	l := New(ctx, rdb, keyConfFn, Options{Logger: NewLogger(t)})
+	l := New(ctx, rdb, keyConfFn, Options{Logger: NewLogger(t), BatchDuration: 1 * time.Microsecond})
 	t.Cleanup(func() {
 		l.Close()
 		_ = rdb.Close()
@@ -59,7 +59,7 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 	// avoid testing over the first interval wrap, which can cause more requests to
 	// be allowed
 	time.Sleep(time.Until(time.Now().Truncate(interval).Add(interval)))
-	return l, key
+	return mr, l, key
 }
 
 func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
@@ -91,7 +91,11 @@ type testOutput struct {
 }
 
 func (o *testOutput) Write(p []byte) (n int, err error) {
-	line := strings.TrimSpace(string(p))
+	// The escape sequence clears the line before writing the log message.
+	// This is unfortunately necessary as we can't call t.Helper() from all of
+	// zap's logging functions, which means t.Log will include an incorrect
+	// caller
+	line := "\x1b[2K\r" + strings.TrimSpace(string(p))
 	o.Log(line)
 	return len(line), nil
 }
@@ -106,10 +110,10 @@ func (w writeSyncer) Sync() error {
 
 func NewLogger(t logger) *zap.Logger {
 	config := zap.NewDevelopmentEncoderConfig()
-	config.TimeKey = ""
+	// config.TimeKey = ""
 	return zap.New(zapcore.NewCore(
 		zapcore.NewConsoleEncoder(config),
 		writeSyncer{&testOutput{t}},
 		zap.InfoLevel,
-	))
+	), zap.AddCaller())
 }

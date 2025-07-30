@@ -17,19 +17,23 @@ func TestBasic(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(10)
 	interval := 100 * time.Millisecond
-	l, key := setup(t, ctx, rate, interval)
+	mr, l, key := setup(t, ctx, rate, interval)
 
 	allowed := 0
+	denied := 0
 	for range 15 {
 		if l.Allow(ctx, key) {
 			allowed++
+			t.Log("request allowed")
+		} else {
+			denied++
+			t.Log("request blocked by rate limiting")
 		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	assert.GreaterOrEqual(t, allowed, int(rate))
-
-	// wait for batch processing and mitigation
-	time.Sleep(interval)
-	require.False(t, l.Allow(ctx, key), "should be blocked after burst")
+	assert.Equal(t, int(rate), allowed)
+	assert.Equal(t, 5, denied)
+	t.Logf("redis requests: %d\n", mr.CommandCount())
 
 	now := time.Now()
 	l.Wait(ctx, key)
@@ -49,7 +53,7 @@ func TestConcurrent(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(100)
 	interval := 500 * time.Millisecond
-	l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval)
 	granularity := time.Duration(interval.Nanoseconds() / 4)
 
 	var wg sync.WaitGroup
@@ -120,7 +124,7 @@ func TestRefreshKey(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
-	l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval)
 
 	for range 5 {
 		require.True(t, l.Allow(ctx, key), "should allow initial requests")
@@ -149,7 +153,7 @@ func TestRefresh(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
-	l, key1 := setup(t, ctx, rate, interval)
+	_, l, key1 := setup(t, ctx, rate, interval)
 	key2 := key1 + "-key2"
 
 	for range 5 {
@@ -178,7 +182,7 @@ func TestWait_ContextCancellation(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(1)
 	interval := 100 * time.Millisecond
-	l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval)
 
 	// Exceed the rate limit to trigger mitigation.
 	l.Allow(ctx, key)
@@ -201,7 +205,7 @@ func TestWait_ContextCancellation(t *testing.T) {
 func TestClose(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	l, _ := setup(t, ctx, 10, time.Second)
+	_, l, _ := setup(t, ctx, 10, time.Second)
 	// close manually
 	l.Close()
 	// Close is called automatically via t.Cleanup inside setup() and should not error or block even with us already having closed
@@ -212,7 +216,7 @@ func TestAllow_AsyncIncrementRace(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(10)
 	interval := 500 * time.Millisecond
-	l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval)
 
 	// Fire a burst of requests. More than the rate limit may be allowed initially
 	// because of the async incrementer.

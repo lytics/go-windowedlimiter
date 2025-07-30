@@ -23,7 +23,8 @@ type KeyConf struct {
 
 // Options is a set of options for creating a new Limiter
 type Options struct {
-	Logger *zap.Logger // The zap logger to use for logging. Will default to not logging anything
+	Logger        *zap.Logger   // The zap logger to use for logging. Will default to not logging anything
+	BatchDuration time.Duration // The duration for the incrementer batch processing. Defaults to 1000ms
 }
 
 // New creates a new Limiter with the provided Redis client and options
@@ -36,13 +37,19 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 		logger: zap.NewNop(),
 		rdb:    rdb,
 		// TODO: expire keyConfCache entries
-		keyConfCache: xsync.NewMapOf[*KeyConf](),
-		keyConfFn:    keyConfFn,
-		incrChan:     make(chan string, 10),
-		doneChan:     make(chan struct{}),
+		keyConfCache:  xsync.NewMapOf[*KeyConf](),
+		keyConfFn:     keyConfFn,
+		incrChan:      make(chan string, 100),
+		doneChan:      make(chan struct{}),
+		batchDuration: 1000 * time.Millisecond,
 	}
 	if len(options) > 0 {
-		l.logger = options[0].Logger
+		if options[0].Logger != nil {
+			l.logger = options[0].Logger
+		}
+		if options[0].BatchDuration > 0 {
+			l.batchDuration = options[0].BatchDuration
+		}
 	}
 	allow := func(ctx context.Context, key string) bool {
 		allowed, err := l.checkRedis(ctx, key)
@@ -69,6 +76,7 @@ type Limiter struct {
 	incrChan        chan string
 	doneChan        chan struct{}
 	wg              sync.WaitGroup
+	batchDuration   time.Duration
 }
 
 // SetRDB sets the redis client on the limiter. This is thread-safe.
@@ -128,17 +136,23 @@ func (l *Limiter) RefreshKey(ctx context.Context, key string) {
 func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 	keyConf, ok := l.keyConfCache.Load(key)
 	if !ok {
-		keyConf = l.keyConfFn(ctx, key)
 		l.keyConfCache.Store(key, keyConf)
+	}
+	keyConf = l.keyConfFn(ctx, key)
+	if l.batchDuration > keyConf.Interval {
+		l.logger.Info("storing new incrementer batch window")
+		l.mu.Lock()
+		l.batchDuration = keyConf.Interval
+		l.mu.Unlock()
 	}
 	return keyConf
 }
 
 func (l *Limiter) incrementer(ctx context.Context) {
-	l.wg.Done()
+	defer l.wg.Done()
 
 	keysToIncr := make(map[string]int64)
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(l.batchDuration)
 	defer ticker.Stop()
 
 	for {
@@ -154,12 +168,14 @@ func (l *Limiter) incrementer(ctx context.Context) {
 		case key := <-l.incrChan:
 			keysToIncr[key]++
 			// if the channel is getting full, process the batch to avoid blocking callers
-			if len(l.incrChan) > cap(l.incrChan)/2 {
+			if len(l.incrChan) >= cap(l.incrChan)/2 {
+				l.logger.Debug("incrementer processing batch due to high channel usage", zap.Int("current_size", len(l.incrChan)), zap.Int("capacity", cap(l.incrChan)))
 				l.processIncrBatch(ctx, keysToIncr)
 				keysToIncr = make(map[string]int64)
 			}
 		case <-ticker.C:
 			if len(keysToIncr) > 0 {
+				l.logger.Debug("sending batch", zap.Int("count", len(keysToIncr)))
 				l.processIncrBatch(ctx, keysToIncr)
 				keysToIncr = make(map[string]int64)
 			}
