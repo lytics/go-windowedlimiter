@@ -64,11 +64,11 @@ func TestBasic(t *testing.T) {
 func TestConcurrent(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	rate := int64(100)
-	// interval := 50 * time.Millisecond
-	interval := 4 * time.Second
-	_, l, key := setup(t, ctx, rate, interval, 25*time.Millisecond)
-	granularity := time.Duration(interval.Nanoseconds() / 4)
+	rate := int64(80)
+	interval := 1000 * time.Millisecond
+	_, l, key := setup(t, ctx, rate, interval, 250*time.Millisecond)
+	granularity := 4 // how many chunks to divide each interval into for analysis
+	granularityDuration := time.Duration(interval.Nanoseconds() / int64(granularity))
 
 	var wg sync.WaitGroup
 	var durations []time.Duration
@@ -83,7 +83,7 @@ func TestConcurrent(t *testing.T) {
 		for {
 			select {
 			case ts := <-timesChan:
-				intervals[ts.Truncate(granularity)]++
+				intervals[ts.Truncate(granularityDuration)]++
 			case d := <-durationsChan:
 				durations = append(durations, d)
 			case <-done:
@@ -91,7 +91,7 @@ func TestConcurrent(t *testing.T) {
 				for {
 					select {
 					case ts := <-timesChan:
-						intervals[ts.Truncate(granularity)]++
+						intervals[ts.Truncate(granularityDuration)]++
 					case d := <-durationsChan:
 						durations = append(durations, d)
 					default:
@@ -102,7 +102,7 @@ func TestConcurrent(t *testing.T) {
 		}
 	})
 
-	for i := range 10 {
+	for range 10 {
 		wg.Add(1)
 		labels := pprof.Labels("name", "testWaiter")
 		go pprof.Do(ctx, labels, func(context.Context) {
@@ -110,10 +110,8 @@ func TestConcurrent(t *testing.T) {
 			for j := 0; int64(j) < rate; j++ {
 				now := time.Now()
 				l.Wait(ctx, key)
-				l.logger.Debug("sent one", zap.Int("worker", i), zap.Int("iteration", j), zap.String("key", key))
 				timesChan <- time.Now()
 				durationsChan <- time.Since(now)
-				time.Sleep(1 * time.Millisecond)
 			}
 		})
 	}
@@ -126,7 +124,7 @@ func TestConcurrent(t *testing.T) {
 	time.Sleep(interval * 3)
 	require.True(t, l.mitigationCache.Allow(ctx, key), "should not be mitigated")
 
-	analyzeIntervals(t, l.logger, interval, granularity, rate, intervals)
+	analyzeIntervals(t, l.logger, interval, granularity, granularityDuration, rate, intervals)
 
 	total := len(durations)
 	assert.NotZero(t, total, "didn't record any requests")
@@ -139,7 +137,7 @@ func TestRefreshKey(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval, 20*time.Millisecond)
+	_, l, key := setup(t, ctx, rate, interval, 1*time.Second)
 
 	for range 5 {
 		require.True(t, l.Allow(ctx, key), "should allow initial requests")

@@ -63,7 +63,7 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval, batchDuratio
 	return mr, l, key
 }
 
-func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granularity time.Duration, rate int64, intervals map[time.Time]int64) {
+func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granularity int, granularityDuration time.Duration, rate int64, intervals map[time.Time]int64) {
 	t.Helper()
 	logger = logger.WithOptions(zap.AddCallerSkip(1))
 	var minInterval time.Time
@@ -76,11 +76,19 @@ func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granula
 			maxInterval = s
 		}
 	}
-	for i := minInterval; i.Before(maxInterval); i = i.Add(granularity) {
+	for i := minInterval; i.Before(maxInterval); i = i.Add(granularityDuration) {
 		logger.Sugar().Infof("requests in interval %v: %d", i.Format("05.000"), intervals[i])
 	}
-	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularity*0)], rate, "first interval should have at least rate requests")
-	assert.Equal(t, int64(0), intervals[minInterval.Add(granularity*1)], "second interval should have zero requests")
+	assert.NotEmpty(t, intervals, "intervals should not be empty")
+	assert.GreaterOrEqual(t, intervals[minInterval.Add(granularityDuration*0)], rate, "first interval should have at least rate requests")
+	assert.Equal(t, int64(0), intervals[minInterval.Add(granularityDuration*1)], "second interval should have zero requests")
+	// check if the average rate is close to the expected rate
+	var total int64
+	for _, count := range intervals {
+		total += count
+	}
+	avgRate := float64(total) / float64(len(intervals)) * float64(granularity)
+	assert.InDelta(t, rate, avgRate, float64(rate)*0.1)
 }
 
 type logger interface {

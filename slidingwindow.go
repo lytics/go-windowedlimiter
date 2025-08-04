@@ -32,6 +32,9 @@ func OptionWithLogger(l *zap.Logger) Option {
 //
 // It is important that this is set to a value that is smaller thant the
 // smallest KeyConf interval, or a mitigation will never be triggered.
+// Ideally at least 4x smaller, if you want smooth rates.
+//
+// The default is set with the assumption that per second limits are going to happen.
 func OptionWithBatchDuration(t time.Duration) Option {
 	return func(limiter *Limiter) {
 		limiter.batchDuration = t
@@ -64,7 +67,7 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 		keyConfFn:     keyConfFn,
 		incrChan:      make(chan string),
 		doneChan:      make(chan struct{}),
-		batchDuration: 1 * time.Second,
+		batchDuration: 250 * time.Second,
 	}
 	for _, o := range options {
 		o(l)
@@ -172,25 +175,20 @@ func (l *Limiter) incrementer(ctx context.Context) {
 			return
 		case key := <-l.incrChan:
 			keysToIncr[key]++
+			keyConf := l.keyConf(ctx, key)
+			if keysToIncr[key] > keyConf.Rate {
+				// short-circuit if we already know a key is over the limit
+				l.logger.Debug("key increments over limit, mitigating and flushing immediately", zap.String("key", key), zap.Int64("count", keysToIncr[key]))
+				l.mitigate(ctx, key)
+				l.processIncrBatch(ctx, keysToIncr)
+				keysToIncr = make(map[string]int64) // reset the batch after processing
+			}
 		case <-ticker.C:
 			if len(keysToIncr) == 0 {
 				continue
 			}
-			batch := make(map[string]int64, len(keysToIncr))
-			kept := make(map[string]int64, len(keysToIncr))
-			for key, count := range keysToIncr {
-				if l.mitigationCache.Contains(ctx, key) {
-					if count%10 == 0 {
-						batch[key] = count * 10
-					} else {
-						kept[key] = count
-					}
-				} else {
-					batch[key] = count
-				}
-			}
-			l.processIncrBatch(ctx, batch)
-			keysToIncr = kept
+			l.processIncrBatch(ctx, keysToIncr)
+			keysToIncr = make(map[string]int64) // reset the batch after processing
 		}
 	}
 }
@@ -218,11 +216,7 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 		curIntStart := now.Truncate(keyConf.Interval)
 		curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
 		l.logger.Debug("sending increments", zap.String("key", key), zap.Int64("count", count))
-		if l.mitigationCache.Contains(ctx, key) {
-			cmds[key] = pipe.IncrBy(ctx, curKey, count*10)
-		} else {
-			cmds[key] = pipe.IncrBy(ctx, curKey, count)
-		}
+		cmds[key] = pipe.IncrBy(ctx, curKey, count)
 		pipe.Expire(ctx, curKey, max(3*keyConf.Interval, time.Second))
 	}
 
