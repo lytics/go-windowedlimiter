@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestBasic(t *testing.T) {
@@ -17,23 +18,35 @@ func TestBasic(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(10)
 	interval := 100 * time.Millisecond
-	mr, l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval, 49*time.Millisecond)
 
 	allowed := 0
 	denied := 0
-	for range 15 {
+	for range rate {
 		if l.Allow(ctx, key) {
 			allowed++
-			t.Log("request allowed")
 		} else {
 			denied++
-			t.Log("request blocked by rate limiting")
 		}
-		time.Sleep(2 * time.Millisecond)
 	}
+	l.logger.Info("counts", zap.Int("allowed", allowed), zap.Int("denied", denied))
 	assert.Equal(t, int(rate), allowed)
-	assert.Equal(t, 5, denied)
-	t.Logf("redis requests: %d\n", mr.CommandCount())
+	assert.Equal(t, 0, denied)
+
+	time.Sleep(l.batchDuration) // let incrementer run
+
+	allowed = 0
+	denied = 0
+	for range rate {
+		if l.Allow(ctx, key) {
+			allowed++
+		} else {
+			denied++
+		}
+	}
+	l.logger.Info("counts", zap.Int("allowed", allowed), zap.Int("denied", denied))
+	assert.Equal(t, 0, allowed)
+	assert.Equal(t, int(rate), denied)
 
 	now := time.Now()
 	l.Wait(ctx, key)
@@ -52,8 +65,9 @@ func TestConcurrent(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	rate := int64(100)
-	interval := 500 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval)
+	// interval := 50 * time.Millisecond
+	interval := 4 * time.Second
+	_, l, key := setup(t, ctx, rate, interval, 25*time.Millisecond)
 	granularity := time.Duration(interval.Nanoseconds() / 4)
 
 	var wg sync.WaitGroup
@@ -88,7 +102,7 @@ func TestConcurrent(t *testing.T) {
 		}
 	})
 
-	for range 10 {
+	for i := range 10 {
 		wg.Add(1)
 		labels := pprof.Labels("name", "testWaiter")
 		go pprof.Do(ctx, labels, func(context.Context) {
@@ -96,6 +110,7 @@ func TestConcurrent(t *testing.T) {
 			for j := 0; int64(j) < rate; j++ {
 				now := time.Now()
 				l.Wait(ctx, key)
+				l.logger.Debug("sent one", zap.Int("worker", i), zap.Int("iteration", j), zap.String("key", key))
 				timesChan <- time.Now()
 				durationsChan <- time.Since(now)
 				time.Sleep(1 * time.Millisecond)
@@ -116,7 +131,7 @@ func TestConcurrent(t *testing.T) {
 	total := len(durations)
 	assert.NotZero(t, total, "didn't record any requests")
 
-	l.logger.Sugar().Infof("total sent: %d", len(durations))
+	l.logger.Info("total sent", zap.Int("count", len(durations)))
 }
 
 func TestRefreshKey(t *testing.T) {
@@ -124,12 +139,12 @@ func TestRefreshKey(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval, 20*time.Millisecond)
 
 	for range 5 {
 		require.True(t, l.Allow(ctx, key), "should allow initial requests")
 	}
-	time.Sleep(50 * time.Millisecond) // let incrementer run
+	time.Sleep(l.batchDuration) // let incrementer run
 
 	require.False(t, l.Allow(ctx, key), "should not allow after rate limit is hit")
 
@@ -142,7 +157,7 @@ func TestRefreshKey(t *testing.T) {
 	for i := range 10 {
 		require.True(t, l.Allow(ctx, key), "should allow requests after refreshing key conf, attempt %d", i+1)
 	}
-	time.Sleep(50 * time.Millisecond) // let incrementer run
+	time.Sleep(l.batchDuration) // let incrementer run
 	allowed, err := l.checkRedis(ctx, key)
 	require.NoError(t, err)
 	require.True(t, allowed, "checkRedis should allow after refreshing key conf")
@@ -153,14 +168,15 @@ func TestRefresh(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(5)
 	interval := 100 * time.Millisecond
-	_, l, key1 := setup(t, ctx, rate, interval)
+	_, l, key1 := setup(t, ctx, rate, interval, 49*time.Millisecond)
 	key2 := key1 + "-key2"
 
 	for range 5 {
 		require.True(t, l.Allow(ctx, key1), "should allow initial requests for key 1")
 		require.True(t, l.Allow(ctx, key2), "should allow initial requests for key 2")
 	}
-	time.Sleep(50 * time.Millisecond) // let incrementer run
+
+	time.Sleep(l.batchDuration) // let incrementer run
 
 	require.False(t, l.Allow(ctx, key1), "should not allow for key 1 after rate limit is hit")
 	require.False(t, l.Allow(ctx, key2), "should not allow for key 2 after rate limit is hit")
@@ -182,13 +198,13 @@ func TestWait_ContextCancellation(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(1)
 	interval := 100 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval, 49*time.Millisecond)
 
 	// Exceed the rate limit to trigger mitigation.
 	l.Allow(ctx, key)
-	time.Sleep(50 * time.Millisecond) // let incrementer run
+	time.Sleep(l.batchDuration) // let incrementer run
 	l.Allow(ctx, key)
-	time.Sleep(50 * time.Millisecond) // let incrementer run
+	time.Sleep(l.batchDuration) // let incrementer run
 	require.False(t, l.mitigationCache.Allow(ctx, key), "should be mitigated")
 
 	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
@@ -205,7 +221,7 @@ func TestWait_ContextCancellation(t *testing.T) {
 func TestClose(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	_, l, _ := setup(t, ctx, 10, time.Second)
+	_, l, _ := setup(t, ctx, 10, time.Second, 49*time.Millisecond)
 	// close manually
 	l.Close()
 	// Close is called automatically via t.Cleanup inside setup() and should not error or block even with us already having closed
@@ -216,7 +232,7 @@ func TestAllow_AsyncIncrementRace(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(10)
 	interval := 500 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval)
+	_, l, key := setup(t, ctx, rate, interval, 49*time.Millisecond)
 
 	// Fire a burst of requests. More than the rate limit may be allowed initially
 	// because of the async incrementer.
@@ -227,11 +243,11 @@ func TestAllow_AsyncIncrementRace(t *testing.T) {
 		}
 	}
 
-	t.Logf("Allowed %d requests initially in a burst", allowedCount)
+	l.logger.Info("initial allowed requests", zap.Int("count", allowedCount))
 	assert.GreaterOrEqual(t, allowedCount, int(rate), "at least 'rate' should be allowed")
 
 	// Wait for incrementer to catch up and mitigation to trigger.
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(l.batchDuration)
 
 	// Now, subsequent requests should be denied.
 	assert.False(t, l.Allow(ctx, key), "should not be allowed after incrementer catches up")
@@ -259,7 +275,7 @@ func BenchmarkAllow_Contended(b *testing.B) {
 	for range 10 {
 		l.Allow(ctx, key)
 	}
-	time.Sleep(50 * time.Millisecond) // let incrementer run
+	time.Sleep(l.batchDuration) // let incrementer run
 
 	for b.Loop() {
 		l.Allow(ctx, key)
@@ -272,9 +288,9 @@ func BenchmarkWait(b *testing.B) {
 	interval := 1 * time.Minute
 	l, key := setupBench(b, ctx, rate, interval)
 	l.Allow(ctx, key)
-	time.Sleep(50 * time.Millisecond) // let incrementer run
-	l.Allow(ctx, key)                 // trigger mitigation
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(l.batchDuration) // let incrementer run
+	l.Allow(ctx, key)           // trigger mitigation
+	time.Sleep(l.batchDuration)
 
 	for b.Loop() {
 		l.Wait(ctx, key)

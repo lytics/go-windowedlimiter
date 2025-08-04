@@ -76,13 +76,15 @@ func (mc *MitigationCache) Close(key string) {
 // period is how often to retry the allowFn, which will be the maximum rate requests are allowed
 //
 // allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive. allowFn must be thread safe.
-func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.Duration) {
+//
+// It returns true if the mitigation was freshly triggered, and false if it was already active and just had its ttl extended.
+func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.Duration) bool {
 	m, ok := mc.cache.Load(key)
 	if ok {
 		m.mu.Lock()
 		m.ttl = time.Now().Add(time.Duration(ttlMultiplier) * period)
 		m.mu.Unlock()
-		return
+		return false
 	}
 	m = &Mitigation{
 		period: period,
@@ -164,6 +166,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 			}
 		}
 	})
+	return true
 }
 
 // Wait blocks until the mitigation fires, is cancelled via context, or is done.
@@ -217,4 +220,10 @@ func (mc *MitigationCache) Allow(ctx context.Context, key string) bool {
 	// bump the ttl as if we're only using Allow, the per-mitigation gc/ticker goroutine will not
 	m.ttl = time.Now().Add(3 * m.period)
 	return false
+}
+
+// Contains returns true if a mitigation exists for the given key.
+func (mc *MitigationCache) Contains(ctx context.Context, key string) bool {
+	_, ok := mc.cache.Load(key)
+	return ok
 }

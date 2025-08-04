@@ -40,7 +40,7 @@ func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Dur
 	return l, key
 }
 
-func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration) (*miniredis.Miniredis, *Limiter, string) {
+func setup(t *testing.T, ctx context.Context, rate int64, interval, batchDuration time.Duration) (*miniredis.Miniredis, *Limiter, string) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{
@@ -51,8 +51,9 @@ func setup(t *testing.T, ctx context.Context, rate int64, interval time.Duration
 	keyConfFn := func(ctx context.Context, key string) *KeyConf {
 		return &KeyConf{Rate: rate, Interval: interval}
 	}
-	l := New(ctx, rdb, keyConfFn, Options{Logger: NewLogger(t), BatchDuration: 1 * time.Microsecond})
+	l := New(ctx, rdb, keyConfFn, OptionWithLogger(NewLogger(t)), OptionWithBatchDuration(batchDuration))
 	t.Cleanup(func() {
+		l.logger.Info("redis commands", zap.Int("count", mr.CommandCount()))
 		l.Close()
 		_ = rdb.Close()
 	})
@@ -114,6 +115,6 @@ func NewLogger(t logger) *zap.Logger {
 	return zap.New(zapcore.NewCore(
 		zapcore.NewConsoleEncoder(config),
 		writeSyncer{&testOutput{t}},
-		zap.InfoLevel,
+		zap.DebugLevel,
 	), zap.AddCaller())
 }

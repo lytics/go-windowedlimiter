@@ -15,16 +15,39 @@ import (
 	"go.uber.org/zap"
 )
 
-// KeyConf is a configuration for a key. It's set lazily per-key by calling Options.KeyConfFn
+type Option func(*Limiter)
+
+func OptionWithLogger(l *zap.Logger) Option {
+	return func(limiter *Limiter) {
+		limiter.logger = l
+	}
+}
+
+// OptionWithBatchDuration sets how long to wait maximum before flushing all
+// waiting increments.
+//
+// This is proportional to both how much over the limit a key can go before
+// being mitigated, and inversely proportional to how many writes to the remote
+// cache are made.
+//
+// It is important that this is set to a value that is smaller thant the
+// smallest KeyConf interval, or a mitigation will never be triggered.
+func OptionWithBatchDuration(t time.Duration) Option {
+	return func(limiter *Limiter) {
+		limiter.batchDuration = t
+	}
+}
+
+// KeyConf is a configuration for a key. It's set lazily per-key by calling
+// Options.KeyConfFn
+//
+// Rate is the number of allowed calls per interval.
+//
+// Interval is the duration of the sliding window for the rate limit. Larger
+// intervals will decrease the requests to redis.
 type KeyConf struct {
 	Rate     int64
 	Interval time.Duration
-}
-
-// Options is a set of options for creating a new Limiter
-type Options struct {
-	Logger        *zap.Logger   // The zap logger to use for logging. Will default to not logging anything
-	BatchDuration time.Duration // The duration for the incrementer batch processing. Defaults to 1000ms
 }
 
 // New creates a new Limiter with the provided Redis client and options
@@ -32,24 +55,19 @@ type Options struct {
 // Note that rdb needs to be carefully configured for timeouts if you expect redis outages to not have severe impacts on latency.
 //
 // KeyConfFn returns a KeyConf for a given key. This will be called lazily, once per key, until `Limiter.Refresh()` or `Limiter.RefreshKey(key string)` is called.
-func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Context, key string) *KeyConf, options ...Options) *Limiter {
+func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Context, key string) *KeyConf, options ...Option) *Limiter {
 	l := &Limiter{
 		logger: zap.NewNop(),
 		rdb:    rdb,
 		// TODO: expire keyConfCache entries
 		keyConfCache:  xsync.NewMapOf[*KeyConf](),
 		keyConfFn:     keyConfFn,
-		incrChan:      make(chan string, 100),
+		incrChan:      make(chan string),
 		doneChan:      make(chan struct{}),
-		batchDuration: 1000 * time.Millisecond,
+		batchDuration: 1 * time.Second,
 	}
-	if len(options) > 0 {
-		if options[0].Logger != nil {
-			l.logger = options[0].Logger
-		}
-		if options[0].BatchDuration > 0 {
-			l.batchDuration = options[0].BatchDuration
-		}
+	for _, o := range options {
+		o(l)
 	}
 	allow := func(ctx context.Context, key string) bool {
 		allowed, err := l.checkRedis(ctx, key)
@@ -77,13 +95,6 @@ type Limiter struct {
 	doneChan        chan struct{}
 	wg              sync.WaitGroup
 	batchDuration   time.Duration
-}
-
-// SetRDB sets the redis client on the limiter. This is thread-safe.
-func (l *Limiter) SetRDB(rdb redis.Cmdable) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.rdb = rdb
 }
 
 // Close stops all goroutines, flushes logging, and waits for completion.
@@ -139,12 +150,6 @@ func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 		l.keyConfCache.Store(key, keyConf)
 	}
 	keyConf = l.keyConfFn(ctx, key)
-	if l.batchDuration > keyConf.Interval {
-		l.logger.Info("storing new incrementer batch window")
-		l.mu.Lock()
-		l.batchDuration = keyConf.Interval
-		l.mu.Unlock()
-	}
 	return keyConf
 }
 
@@ -167,18 +172,25 @@ func (l *Limiter) incrementer(ctx context.Context) {
 			return
 		case key := <-l.incrChan:
 			keysToIncr[key]++
-			// if the channel is getting full, process the batch to avoid blocking callers
-			if len(l.incrChan) >= cap(l.incrChan)/2 {
-				l.logger.Debug("incrementer processing batch due to high channel usage", zap.Int("current_size", len(l.incrChan)), zap.Int("capacity", cap(l.incrChan)))
-				l.processIncrBatch(ctx, keysToIncr)
-				keysToIncr = make(map[string]int64)
-			}
 		case <-ticker.C:
-			if len(keysToIncr) > 0 {
-				l.logger.Debug("sending batch", zap.Int("count", len(keysToIncr)))
-				l.processIncrBatch(ctx, keysToIncr)
-				keysToIncr = make(map[string]int64)
+			if len(keysToIncr) == 0 {
+				continue
 			}
+			batch := make(map[string]int64, len(keysToIncr))
+			kept := make(map[string]int64, len(keysToIncr))
+			for key, count := range keysToIncr {
+				if l.mitigationCache.Contains(ctx, key) {
+					if count%10 == 0 {
+						batch[key] = count * 10
+					} else {
+						kept[key] = count
+					}
+				} else {
+					batch[key] = count
+				}
+			}
+			l.processIncrBatch(ctx, batch)
+			keysToIncr = kept
 		}
 	}
 }
@@ -205,12 +217,17 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 		keyConf := l.keyConf(ctx, key)
 		curIntStart := now.Truncate(keyConf.Interval)
 		curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
-		cmds[key] = pipe.IncrBy(ctx, curKey, count)
+		l.logger.Debug("sending increments", zap.String("key", key), zap.Int64("count", count))
+		if l.mitigationCache.Contains(ctx, key) {
+			cmds[key] = pipe.IncrBy(ctx, curKey, count*10)
+		} else {
+			cmds[key] = pipe.IncrBy(ctx, curKey, count)
+		}
 		pipe.Expire(ctx, curKey, max(3*keyConf.Interval, time.Second))
 	}
 
 	_, err := pipe.Exec(ctx)
-	if err != nil && !errors.Is(err, redis.ErrClosed) {
+	if err != nil && !errors.Is(err, redis.ErrClosed) && !errors.Is(err, context.Canceled) {
 		l.logger.Error("error executing increment pipeline", zap.Error(err))
 	}
 
@@ -277,8 +294,9 @@ func (l *Limiter) mitigate(ctx context.Context, key string) {
 	logger := l.logger.With(keyField(key))
 	keyConf := l.keyConf(ctx, key)
 	period := time.Duration(keyConf.Interval.Nanoseconds() / keyConf.Rate)
-	logger.Debug("mitigating", zap.Duration("period", period))
-	l.mitigationCache.Trigger(ctx, key, period)
+	if l.mitigationCache.Trigger(ctx, key, period) {
+		logger.Debug("new mitigation")
+	}
 }
 
 func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool) {
