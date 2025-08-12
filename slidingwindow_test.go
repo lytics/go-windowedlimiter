@@ -136,13 +136,13 @@ func TestRefreshKey(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 	rate := int64(5)
-	interval := 100 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval, 1*time.Second)
+	interval := 1000 * time.Millisecond
+	_, l, key := setup(t, ctx, rate, interval, 1*time.Microsecond)
 
 	for range 5 {
 		require.True(t, l.Allow(ctx, key), "should allow initial requests")
 	}
-	time.Sleep(l.batchDuration) // let incrementer run
+	time.Sleep(5 * time.Millisecond)
 
 	require.False(t, l.Allow(ctx, key), "should not allow after rate limit is hit")
 
@@ -151,6 +151,8 @@ func TestRefreshKey(t *testing.T) {
 		return &KeyConf{Rate: 15, Interval: interval}
 	}
 	l.RefreshKey(ctx, key)
+
+	time.Sleep(interval)
 
 	for i := range 10 {
 		require.True(t, l.Allow(ctx, key), "should allow requests after refreshing key conf, attempt %d", i+1)
@@ -198,11 +200,7 @@ func TestWait_ContextCancellation(t *testing.T) {
 	interval := 100 * time.Millisecond
 	_, l, key := setup(t, ctx, rate, interval, 49*time.Millisecond)
 
-	// Exceed the rate limit to trigger mitigation.
-	l.Allow(ctx, key)
-	time.Sleep(l.batchDuration) // let incrementer run
-	l.Allow(ctx, key)
-	time.Sleep(l.batchDuration) // let incrementer run
+	require.Eventually(t, func() bool { return !l.Allow(ctx, key) }, interval, 1*time.Microsecond)
 	require.False(t, l.mitigationCache.Allow(ctx, key), "should be mitigated")
 
 	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
