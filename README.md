@@ -1,4 +1,4 @@
-# go-slidingwindow
+# go-windowedlimiter
 
 An implementation of a fully-featured sliding window rate limiter in golang.
 

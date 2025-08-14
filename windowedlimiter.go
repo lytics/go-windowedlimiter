@@ -1,4 +1,4 @@
-package slidingwindow
+package windowedlimiter
 
 import (
 	"context"
@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lytics/go-windowedlimiter/internal/mitigation"
 	"github.com/puzpuzpuz/xsync"
 	"github.com/redis/go-redis/v9"
-	"github.com/vitaminmoo/go-slidingwindow/internal/mitigation"
 	"go.uber.org/zap"
 )
 

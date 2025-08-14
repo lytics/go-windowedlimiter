@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lytics/go-windowedlimiter/internal/fifo"
 	"github.com/puzpuzpuz/xsync"
-	"github.com/vitaminmoo/go-slidingwindow/internal/fifo"
 )
 
 var ttlMultiplier = 3
