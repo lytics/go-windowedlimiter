@@ -17,6 +17,11 @@ import (
 	"github.com/puzpuzpuz/xsync"
 )
 
+type Key interface {
+	comparable
+	fmt.Stringer
+}
+
 var ttlMultiplier = 3
 
 type tick struct {
@@ -36,22 +41,24 @@ type Mitigation struct {
 	allowOne bool               // if false, first allowed request toggles this for the next Allow() call to consume
 }
 
-func New(allowFn func(context.Context, string) bool) *MitigationCache {
-	mc := &MitigationCache{
-		cache:   xsync.NewMapOf[*Mitigation](),
+func New[K Key](allowFn func(context.Context, K) bool) *MitigationCache[K] {
+	mc := &MitigationCache[K]{
+		cache: xsync.NewTypedMapOf[K, *Mitigation](func(k K) uint64 {
+			return xsync.StrHash64(k.String())
+		}),
 		allowFn: allowFn,
 	}
 	return mc
 }
 
-type MitigationCache struct {
-	cache   *xsync.MapOf[string, *Mitigation]
-	allowFn func(ctx context.Context, key string) bool
+type MitigationCache[K Key] struct {
+	cache   *xsync.MapOf[K, *Mitigation]
+	allowFn func(ctx context.Context, key K) bool
 }
 
 // CloseAll cleans up all active mitigations, stopping their goroutines.
-func (mc *MitigationCache) CloseAll() {
-	mc.cache.Range(func(key string, m *Mitigation) bool {
+func (mc *MitigationCache[K]) CloseAll() {
+	mc.cache.Range(func(key K, m *Mitigation) bool {
 		close(m.done)
 		mc.cache.Delete(key)
 		return true
@@ -59,7 +66,7 @@ func (mc *MitigationCache) CloseAll() {
 }
 
 // Close removes a specific mitigation from the cache and stops its goroutine.
-func (mc *MitigationCache) Close(key string) {
+func (mc *MitigationCache[K]) Close(key K) {
 	m, ok := mc.cache.LoadAndDelete(key)
 	if !ok {
 		return
@@ -78,7 +85,7 @@ func (mc *MitigationCache) Close(key string) {
 // allowFn is a function to call that will be the final gatekeeper for whether requests are allowed. The mitigation cache is specifically designed to call this as little as possible, as the allowFn is expected to be expensive. allowFn must be thread safe.
 //
 // It returns true if the mitigation was freshly triggered, and false if it was already active and just had its ttl extended.
-func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.Duration) bool {
+func (mc *MitigationCache[K]) Trigger(ctx context.Context, key K, period time.Duration) bool {
 	m, ok := mc.cache.Load(key)
 	if ok {
 		m.mu.Lock()
@@ -96,7 +103,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 	}
 	mc.cache.Store(key, m)
 
-	go pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
+	go pprof.Do(ctx, pprof.Labels("key", key.String()), func(ctx context.Context) {
 		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 		defer m.q.Close()
@@ -172,7 +179,7 @@ func (mc *MitigationCache) Trigger(ctx context.Context, key string, period time.
 // Wait blocks until the mitigation fires, is cancelled via context, or is done.
 //
 // Note that currently, Wait() unsubscribe/resubscribes to the ringbuffer every time it's called which is pretty non-ideal.
-func (mc *MitigationCache) Wait(ctx context.Context, key string) error {
+func (mc *MitigationCache[K]) Wait(ctx context.Context, key K) error {
 	m, ok := mc.cache.Load(key)
 	if !ok {
 		// we're not actually mitigated
@@ -205,7 +212,7 @@ func (mc *MitigationCache) Wait(ctx context.Context, key string) error {
 }
 
 // Allow reports whether a request is allowed for the given key.
-func (mc *MitigationCache) Allow(ctx context.Context, key string) bool {
+func (mc *MitigationCache[K]) Allow(ctx context.Context, key K) bool {
 	m, ok := mc.cache.Load(key)
 	if !ok {
 		// we're not actually mitigated, allow immediately
@@ -223,7 +230,7 @@ func (mc *MitigationCache) Allow(ctx context.Context, key string) bool {
 }
 
 // Contains returns true if a mitigation exists for the given key.
-func (mc *MitigationCache) Contains(ctx context.Context, key string) bool {
+func (mc *MitigationCache[K]) Contains(ctx context.Context, key K) bool {
 	_, ok := mc.cache.Load(key)
 	return ok
 }

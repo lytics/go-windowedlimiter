@@ -10,12 +10,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type mitKey struct {
+	key string
+}
+
+func (mk mitKey) String() string {
+	return mk.key
+}
+
 func TestMitigate_AllowsRequests(t *testing.T) {
 	ctx := context.Background()
-	key := "test-allow"
+	key := mitKey{key: "test-allow"}
 	period := 10 * time.Millisecond
 	mc := New(
-		func(context.Context, string) bool { return true },
+		func(context.Context, mitKey) bool { return true },
 	)
 
 	// Always allow requests
@@ -30,10 +38,10 @@ func TestMitigate_AllowsRequests(t *testing.T) {
 
 func TestMitigate_BlocksRequests(t *testing.T) {
 	ctx := context.Background()
-	key := "test-block"
+	key := mitKey{key: "test-block"}
 	period := 10 * time.Millisecond
 	mc := New(
-		func(context.Context, string) bool { return false },
+		func(context.Context, mitKey) bool { return false },
 	)
 
 	// Never allow requests
@@ -51,10 +59,10 @@ func TestMitigate_BlocksRequests(t *testing.T) {
 
 func TestMitigate_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	key := "test-cancel"
+	key := mitKey{key: "test-cancel"}
 	period := 10 * time.Millisecond
 	mc := New(
-		func(context.Context, string) bool { return false },
+		func(context.Context, mitKey) bool { return false },
 	)
 
 	mc.Trigger(ctx, key, period)
@@ -70,9 +78,9 @@ func TestMitigate_ContextCancellation(t *testing.T) {
 
 func TestWait_NonExistentKey(t *testing.T) {
 	ctx := context.Background()
-	key := "non-existent"
+	key := mitKey{key: "non-existent"}
 	mc := New(
-		func(context.Context, string) bool { return false },
+		func(context.Context, mitKey) bool { return false },
 	)
 
 	err := mc.Wait(ctx, key)
@@ -83,10 +91,10 @@ func TestWait_NonExistentKey(t *testing.T) {
 
 func TestMitigate_Expiration(t *testing.T) {
 	ctx := context.Background()
-	key := "test-expiration"
+	key := mitKey{key: "test-expiration"}
 	period := 10 * time.Millisecond
 	mc := New(
-		func(context.Context, string) bool { return true },
+		func(context.Context, mitKey) bool { return true },
 	)
 
 	mc.Trigger(ctx, key, period)
@@ -100,13 +108,13 @@ func TestMitigate_Expiration(t *testing.T) {
 
 func TestMitigate_MultipleWaiters(t *testing.T) {
 	ctx := context.Background()
-	key := "test-multiple"
+	key := mitKey{key: "test-multiple"}
 	period := 100 * time.Millisecond
 	num := 10
 
 	var try int
 	mc := New(
-		func(context.Context, string) bool {
+		func(context.Context, mitKey) bool {
 			try++
 			return try >= 5
 		},
@@ -138,12 +146,12 @@ func TestMitigate_MultipleWaiters(t *testing.T) {
 
 func TestMitigate_PeriodReset(t *testing.T) {
 	ctx := context.Background()
-	key := "test-reset"
+	key := mitKey{key: "test-reset"}
 	period := 10 * time.Millisecond
 
 	allowCalls := atomic.Int32{}
 	mc := New(
-		func(context.Context, string) bool {
+		func(context.Context, mitKey) bool {
 			allowCalls.Add(1)
 			return allowCalls.Load() > 2 // Allow after 2 failures
 		},

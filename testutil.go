@@ -15,8 +15,20 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+type rateKey struct {
+	namespace string
+	key       string
+}
+
+func (r rateKey) String() string {
+	if r.namespace == "" {
+		return r.key
+	}
+	return r.namespace + "-" + r.key
+}
+
 // setupBench is a simplified version of setup for benchmarks
-func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Duration) (*Limiter, string) {
+func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Duration) (*Limiter[rateKey], rateKey) {
 	b.Helper()
 	mr, err := miniredis.Run()
 	if err != nil {
@@ -27,12 +39,12 @@ func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Dur
 	rdb := redis.NewClient(&redis.Options{
 		Addr: mr.Addr(),
 	})
-	keyConfFn := func(ctx context.Context, key string) *KeyConf {
+	keyConfFn := func(ctx context.Context, key rateKey) *KeyConf {
 		return &KeyConf{Rate: rate, Interval: interval}
 	}
 	// Benchmarks shouldn't log to avoid skewing results.
 	l := New(ctx, rdb, keyConfFn)
-	key := fmt.Sprintf("%s-%d", b.Name(), time.Now().UnixNano()%1000)
+	key := rateKey{key: fmt.Sprintf("%s-%d", b.Name(), time.Now().UnixNano()%1000)}
 	b.Cleanup(func() {
 		l.Close()
 		_ = rdb.Close()
@@ -40,18 +52,18 @@ func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Dur
 	return l, key
 }
 
-func setup(t *testing.T, ctx context.Context, rate int64, interval, batchDuration time.Duration) (*miniredis.Miniredis, *Limiter, string) {
+func setup(t *testing.T, ctx context.Context, rate int64, interval, batchDuration time.Duration) (*miniredis.Miniredis, *Limiter[rateKey], rateKey) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{
 		Addr: mr.Addr(),
 	})
 
-	key := fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()%1000)
-	keyConfFn := func(ctx context.Context, key string) *KeyConf {
+	key := rateKey{key: fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()%1000)}
+	keyConfFn := func(ctx context.Context, key rateKey) *KeyConf {
 		return &KeyConf{Rate: rate, Interval: interval}
 	}
-	l := New(ctx, rdb, keyConfFn, OptionWithLogger(NewLogger(t)), OptionWithBatchDuration(batchDuration))
+	l := New(ctx, rdb, keyConfFn, OptionWithLogger[rateKey](NewLogger(t)), OptionWithBatchDuration[rateKey](batchDuration))
 	t.Cleanup(func() {
 		l.logger.Info("redis commands", zap.Int("count", mr.CommandCount()))
 		l.Close()

@@ -147,7 +147,7 @@ func TestRefreshKey(t *testing.T) {
 	require.False(t, l.Allow(ctx, key), "should not allow after rate limit is hit")
 
 	// Refresh key to a higher rate limit
-	l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
+	l.keyConfFn = func(ctx context.Context, key rateKey) *KeyConf {
 		return &KeyConf{Rate: 15, Interval: interval}
 	}
 	l.RefreshKey(ctx, key)
@@ -169,7 +169,7 @@ func TestRefresh(t *testing.T) {
 	rate := int64(5)
 	interval := 100 * time.Millisecond
 	_, l, key1 := setup(t, ctx, rate, interval, 49*time.Millisecond)
-	key2 := key1 + "-key2"
+	key2 := rateKey{key: key1.String() + "-key2"}
 
 	for range 5 {
 		require.True(t, l.Allow(ctx, key1), "should allow initial requests for key 1")
@@ -182,7 +182,7 @@ func TestRefresh(t *testing.T) {
 	require.False(t, l.Allow(ctx, key2), "should not allow for key 2 after rate limit is hit")
 
 	// Refresh all keys to a higher rate limit
-	l.keyConfFn = func(ctx context.Context, key string) *KeyConf {
+	l.keyConfFn = func(ctx context.Context, key rateKey) *KeyConf {
 		return &KeyConf{Rate: 15, Interval: interval}
 	}
 	l.Refresh(ctx)

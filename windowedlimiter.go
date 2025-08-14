@@ -15,10 +15,15 @@ import (
 	"go.uber.org/zap"
 )
 
-type Option func(*Limiter)
+type Key interface {
+	comparable
+	fmt.Stringer
+}
 
-func OptionWithLogger(l *zap.Logger) Option {
-	return func(limiter *Limiter) {
+type Option[K Key] func(*Limiter[K])
+
+func OptionWithLogger[K Key](l *zap.Logger) Option[K] {
+	return func(limiter *Limiter[K]) {
 		limiter.logger = l
 	}
 }
@@ -35,8 +40,8 @@ func OptionWithLogger(l *zap.Logger) Option {
 // Ideally at least 4x smaller, if you want smooth rates.
 //
 // The default is set with the assumption that per second limits are going to happen.
-func OptionWithBatchDuration(t time.Duration) Option {
-	return func(limiter *Limiter) {
+func OptionWithBatchDuration[K Key](t time.Duration) Option[K] {
+	return func(limiter *Limiter[K]) {
 		limiter.batchDuration = t
 	}
 }
@@ -58,21 +63,23 @@ type KeyConf struct {
 // Note that rdb needs to be carefully configured for timeouts if you expect redis outages to not have severe impacts on latency.
 //
 // KeyConfFn returns a KeyConf for a given key. This will be called lazily, once per key, until `Limiter.Refresh()` or `Limiter.RefreshKey(key string)` is called.
-func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Context, key string) *KeyConf, options ...Option) *Limiter {
-	l := &Limiter{
+func New[K Key](ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Context, key K) *KeyConf, options ...Option[K]) *Limiter[K] {
+	l := &Limiter[K]{
 		logger: zap.NewNop(),
 		rdb:    rdb,
 		// TODO: expire keyConfCache entries
-		keyConfCache:  xsync.NewMapOf[*KeyConf](),
+		keyConfCache: xsync.NewTypedMapOf[K, *KeyConf](func(k K) uint64 {
+			return xsync.StrHash64(k.String())
+		}),
 		keyConfFn:     keyConfFn,
-		incrChan:      make(chan string),
+		incrChan:      make(chan K),
 		doneChan:      make(chan struct{}),
 		batchDuration: 250 * time.Second,
 	}
 	for _, o := range options {
 		o(l)
 	}
-	allow := func(ctx context.Context, key string) bool {
+	allow := func(ctx context.Context, key K) bool {
 		allowed, err := l.checkRedis(ctx, key)
 		if err != nil {
 			l.logger.Debug("failed to check redis for mitigation status", zap.Error(err))
@@ -87,21 +94,21 @@ func New(ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Cont
 	return l
 }
 
-type Limiter struct {
+type Limiter[K Key] struct {
 	mu              sync.RWMutex
 	logger          *zap.Logger
 	rdb             redis.Cmdable
-	mitigationCache *mitigation.MitigationCache
-	keyConfCache    *xsync.MapOf[string, *KeyConf]
-	keyConfFn       func(ctx context.Context, key string) *KeyConf
-	incrChan        chan string
+	mitigationCache *mitigation.MitigationCache[K]
+	keyConfCache    *xsync.MapOf[K, *KeyConf]
+	keyConfFn       func(ctx context.Context, key K) *KeyConf
+	incrChan        chan K
 	doneChan        chan struct{}
 	wg              sync.WaitGroup
 	batchDuration   time.Duration
 }
 
 // Close stops all goroutines, flushes logging, and waits for completion.
-func (l *Limiter) Close() {
+func (l *Limiter[K]) Close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.mitigationCache.CloseAll()
@@ -115,7 +122,7 @@ func (l *Limiter) Close() {
 }
 
 // SetKeyConfFn sets the KeyConfFn on the limiter and clears all mitigations
-func (l *Limiter) SetKeyConfFn(ctx context.Context, keyConfFn func(ctx context.Context, key string) *KeyConf) {
+func (l *Limiter[K]) SetKeyConfFn(ctx context.Context, keyConfFn func(ctx context.Context, key K) *KeyConf) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.logger.Info("setting new key configuration function")
@@ -126,9 +133,9 @@ func (l *Limiter) SetKeyConfFn(ctx context.Context, keyConfFn func(ctx context.C
 // Refresh causes the KeyConfFn to be called again for all keys (lazily).
 //
 // If your rate limit is changing globally, you should call this once the keyConfFn is returning the new result
-func (l *Limiter) Refresh(ctx context.Context) {
+func (l *Limiter[K]) Refresh(ctx context.Context) {
 	l.logger.Info("refreshing all key configurations")
-	l.keyConfCache.Range(func(key string, _ *KeyConf) bool {
+	l.keyConfCache.Range(func(key K, _ *KeyConf) bool {
 		l.keyConfCache.Delete(key)
 		return true
 	})
@@ -138,7 +145,7 @@ func (l *Limiter) Refresh(ctx context.Context) {
 // RefreshKey causes the KeyConfFn to be called again for the specified key (lazily).
 //
 // If your rate limit is changing for a specific key, you should call this once the keyConfFn is returning the new result
-func (l *Limiter) RefreshKey(ctx context.Context, key string) {
+func (l *Limiter[K]) RefreshKey(ctx context.Context, key K) {
 	logger := l.logger.With(keyField(key))
 	logger.Info("refreshing key configuration")
 	l.keyConfCache.Delete(key)
@@ -147,7 +154,7 @@ func (l *Limiter) RefreshKey(ctx context.Context, key string) {
 }
 
 // keyConf returns the KeyConf for a given key, calling the KeyConfFn if it hasn't been called for this key yet
-func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
+func (l *Limiter[K]) keyConf(ctx context.Context, key K) *KeyConf {
 	keyConf, ok := l.keyConfCache.Load(key)
 	if !ok {
 		l.keyConfCache.Store(key, keyConf)
@@ -156,10 +163,10 @@ func (l *Limiter) keyConf(ctx context.Context, key string) *KeyConf {
 	return keyConf
 }
 
-func (l *Limiter) incrementer(ctx context.Context) {
+func (l *Limiter[K]) incrementer(ctx context.Context) {
 	defer l.wg.Done()
 
-	keysToIncr := make(map[string]int64)
+	keysToIncr := make(map[K]int64)
 	ticker := time.NewTicker(l.batchDuration)
 	defer ticker.Stop()
 
@@ -178,22 +185,22 @@ func (l *Limiter) incrementer(ctx context.Context) {
 			keyConf := l.keyConf(ctx, key)
 			if keysToIncr[key] > keyConf.Rate {
 				// short-circuit if we already know a key is over the limit
-				l.logger.Debug("key increments over limit, mitigating and flushing immediately", zap.String("key", key), zap.Int64("count", keysToIncr[key]))
+				l.logger.Debug("key increments over limit, mitigating and flushing immediately", zap.String("key", key.String()), zap.Int64("count", keysToIncr[key]))
 				l.mitigate(ctx, key)
 				l.processIncrBatch(ctx, keysToIncr)
-				keysToIncr = make(map[string]int64) // reset the batch after processing
+				keysToIncr = make(map[K]int64) // reset the batch after processing
 			}
 		case <-ticker.C:
 			if len(keysToIncr) == 0 {
 				continue
 			}
 			l.processIncrBatch(ctx, keysToIncr)
-			keysToIncr = make(map[string]int64) // reset the batch after processing
+			keysToIncr = make(map[K]int64) // reset the batch after processing
 		}
 	}
 }
 
-func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) {
+func (l *Limiter[K]) processIncrBatch(ctx context.Context, batch map[K]int64) {
 	if len(batch) == 0 {
 		return
 	}
@@ -208,14 +215,14 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 	}
 
 	pipe := rdb.Pipeline()
-	cmds := make(map[string]*redis.IntCmd, len(batch))
+	cmds := make(map[K]*redis.IntCmd, len(batch))
 
 	now := time.Now()
 	for key, count := range batch {
 		keyConf := l.keyConf(ctx, key)
 		curIntStart := now.Truncate(keyConf.Interval)
 		curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
-		l.logger.Debug("sending increments", zap.String("key", key), zap.Int64("count", count))
+		l.logger.Debug("sending increments", keyField(key), zap.Int64("count", count))
 		cmds[key] = pipe.IncrBy(ctx, curKey, count)
 		pipe.Expire(ctx, curKey, max(3*keyConf.Interval, time.Second))
 	}
@@ -228,7 +235,7 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 	for key, cmd := range cmds {
 		res, err := cmd.Result()
 		if err != nil && !errors.Is(err, redis.ErrClosed) {
-			l.logger.Error("error incrementing key in pipeline", zap.String("key", key), zap.Error(err))
+			l.logger.Error("error incrementing key in pipeline", keyField(key), zap.Error(err))
 			continue
 		}
 		keyConf := l.keyConf(ctx, key)
@@ -238,7 +245,7 @@ func (l *Limiter) processIncrBatch(ctx context.Context, batch map[string]int64) 
 	}
 }
 
-func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
+func (l *Limiter[K]) checkRedis(ctx context.Context, key K) (bool, error) {
 	logger := l.logger.With(keyField(key))
 
 	l.mu.RLock()
@@ -284,7 +291,7 @@ func (l *Limiter) checkRedis(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-func (l *Limiter) mitigate(ctx context.Context, key string) {
+func (l *Limiter[K]) mitigate(ctx context.Context, key K) {
 	logger := l.logger.With(keyField(key))
 	keyConf := l.keyConf(ctx, key)
 	period := time.Duration(keyConf.Interval.Nanoseconds() / keyConf.Rate)
@@ -293,14 +300,14 @@ func (l *Limiter) mitigate(ctx context.Context, key string) {
 	}
 }
 
-func (l *Limiter) Allow(ctx context.Context, key string) (allowed bool) {
-	pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
+func (l *Limiter[K]) Allow(ctx context.Context, key K) (allowed bool) {
+	pprof.Do(ctx, pprof.Labels("key", key.String()), func(ctx context.Context) {
 		allowed = l.allow(ctx, key)
 	})
 	return
 }
 
-func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
+func (l *Limiter[K]) allow(ctx context.Context, key K) (allowed bool) {
 	logger := l.logger.With(keyField(key))
 	var err error
 	defer func() {
@@ -326,13 +333,13 @@ func (l *Limiter) allow(ctx context.Context, key string) (allowed bool) {
 	return allowed
 }
 
-func (l *Limiter) Wait(ctx context.Context, key string) {
-	pprof.Do(ctx, pprof.Labels("key", key), func(ctx context.Context) {
+func (l *Limiter[K]) Wait(ctx context.Context, key K) {
+	pprof.Do(ctx, pprof.Labels("key", key.String()), func(ctx context.Context) {
 		l.wait(ctx, key)
 	})
 }
 
-func (l *Limiter) wait(ctx context.Context, key string) {
+func (l *Limiter[K]) wait(ctx context.Context, key K) {
 	logger := l.logger.With(keyField(key))
 	for retries := 0; ; retries++ { // TODO: exponential backoff, and maybe a retry limit?
 		err := l.mitigationCache.Wait(ctx, key)
@@ -354,6 +361,6 @@ func (l *Limiter) wait(ctx context.Context, key string) {
 	}
 }
 
-func keyField(key string) zap.Field {
-	return zap.String("slidingwindow/key", key)
+func keyField[K Key](key K) zap.Field {
+	return zap.String("slidingwindow/key", key.String())
 }
