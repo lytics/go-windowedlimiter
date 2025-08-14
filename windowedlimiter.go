@@ -157,9 +157,11 @@ func (l *Limiter[K]) RefreshKey(ctx context.Context, key K) {
 func (l *Limiter[K]) keyConf(ctx context.Context, key K) *KeyConf {
 	keyConf, ok := l.keyConfCache.Load(key)
 	if !ok {
-		l.keyConfCache.Store(key, keyConf)
+		keyConf = l.keyConfFn(ctx, key)
+		if keyConf != nil {
+			l.keyConfCache.Store(key, keyConf)
+		}
 	}
-	keyConf = l.keyConfFn(ctx, key)
 	return keyConf
 }
 
@@ -183,6 +185,9 @@ func (l *Limiter[K]) incrementer(ctx context.Context) {
 		case key := <-l.incrChan:
 			keysToIncr[key]++
 			keyConf := l.keyConf(ctx, key)
+			if keyConf == nil {
+				continue
+			}
 			if keysToIncr[key] > keyConf.Rate {
 				// short-circuit if we already know a key is over the limit
 				l.logger.Debug("key increments over limit, mitigating and flushing immediately", zap.String("key", key.String()), zap.Int64("count", keysToIncr[key]))
@@ -220,6 +225,9 @@ func (l *Limiter[K]) processIncrBatch(ctx context.Context, batch map[K]int64) {
 	now := time.Now()
 	for key, count := range batch {
 		keyConf := l.keyConf(ctx, key)
+		if keyConf == nil {
+			continue
+		}
 		curIntStart := now.Truncate(keyConf.Interval)
 		curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
 		l.logger.Debug("sending increments", keyField(key), zap.Int64("count", count))
@@ -239,6 +247,9 @@ func (l *Limiter[K]) processIncrBatch(ctx context.Context, batch map[K]int64) {
 			continue
 		}
 		keyConf := l.keyConf(ctx, key)
+		if keyConf == nil {
+			continue
+		}
 		if res >= keyConf.Rate {
 			l.mitigate(ctx, key)
 		}
@@ -254,6 +265,9 @@ func (l *Limiter[K]) checkRedis(ctx context.Context, key K) (bool, error) {
 
 	now := time.Now()
 	keyConf := l.keyConf(ctx, key)
+	if keyConf == nil {
+		return true, fmt.Errorf("no key configuration found for key %s", key)
+	}
 	curIntStart := now.Truncate(keyConf.Interval)
 	prevIntStart := curIntStart.Add(-keyConf.Interval)
 	intervals, err := rdb.MGet(ctx,
@@ -294,6 +308,9 @@ func (l *Limiter[K]) checkRedis(ctx context.Context, key K) (bool, error) {
 func (l *Limiter[K]) mitigate(ctx context.Context, key K) {
 	logger := l.logger.With(keyField(key))
 	keyConf := l.keyConf(ctx, key)
+	if keyConf == nil {
+		return
+	}
 	period := time.Duration(keyConf.Interval.Nanoseconds() / keyConf.Rate)
 	if l.mitigationCache.Trigger(ctx, key, period) {
 		logger.Debug("new mitigation")
