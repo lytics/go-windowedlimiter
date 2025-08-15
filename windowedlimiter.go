@@ -58,12 +58,15 @@ type KeyConf struct {
 	Interval time.Duration
 }
 
+// KeyConfFn is a function that returns a KeyConf for a given key. It will be called lazily and cached forever, unless explicitly evicted.
+type KeyConfFn[K Key] func(ctx context.Context, key K) *KeyConf
+
 // New creates a new Limiter with the provided Redis client and options
 //
 // Note that rdb needs to be carefully configured for timeouts if you expect redis outages to not have severe impacts on latency.
 //
 // KeyConfFn returns a KeyConf for a given key. This will be called lazily, once per key, until `Limiter.Refresh()` or `Limiter.RefreshKey(key string)` is called.
-func New[K Key](ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx context.Context, key K) *KeyConf, options ...Option[K]) *Limiter[K] {
+func New[K Key](ctx context.Context, rdb redis.Cmdable, keyConfFn KeyConfFn[K], options ...Option[K]) *Limiter[K] {
 	l := &Limiter[K]{
 		logger: zap.NewNop(),
 		rdb:    rdb,
@@ -74,7 +77,7 @@ func New[K Key](ctx context.Context, rdb redis.Cmdable, keyConfFn func(ctx conte
 		keyConfFn:     keyConfFn,
 		incrChan:      make(chan K),
 		doneChan:      make(chan struct{}),
-		batchDuration: 250 * time.Second,
+		batchDuration: 1 * time.Second,
 	}
 	for _, o := range options {
 		o(l)
@@ -100,7 +103,7 @@ type Limiter[K Key] struct {
 	rdb             redis.Cmdable
 	mitigationCache *mitigation.MitigationCache[K]
 	keyConfCache    *xsync.MapOf[K, *KeyConf]
-	keyConfFn       func(ctx context.Context, key K) *KeyConf
+	keyConfFn       KeyConfFn[K]
 	incrChan        chan K
 	doneChan        chan struct{}
 	wg              sync.WaitGroup
@@ -122,7 +125,7 @@ func (l *Limiter[K]) Close() {
 }
 
 // SetKeyConfFn sets the KeyConfFn on the limiter and clears all mitigations
-func (l *Limiter[K]) SetKeyConfFn(ctx context.Context, keyConfFn func(ctx context.Context, key K) *KeyConf) {
+func (l *Limiter[K]) SetKeyConfFn(ctx context.Context, keyConfFn KeyConfFn[K]) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.logger.Info("setting new key configuration function")
@@ -188,10 +191,9 @@ func (l *Limiter[K]) incrementer(ctx context.Context) {
 			if keyConf == nil {
 				continue
 			}
-			if keysToIncr[key] > keyConf.Rate {
-				// short-circuit if we already know a key is over the limit
-				l.logger.Debug("key increments over limit, mitigating and flushing immediately", zap.String("key", key.String()), zap.Int64("count", keysToIncr[key]))
-				l.mitigate(ctx, key)
+			if keysToIncr[key]*3 > keyConf.Rate {
+				// short-circuit if we already know a key is headed for mitigation
+				l.logger.Debug("key increments over limit, flushing immediately", zap.String("key", key.String()), zap.Int64("count", keysToIncr[key]))
 				l.processIncrBatch(ctx, keysToIncr)
 				keysToIncr = make(map[K]int64) // reset the batch after processing
 			}
@@ -341,12 +343,15 @@ func (l *Limiter[K]) allow(ctx context.Context, key K) (allowed bool) {
 		return true
 	}
 
-	allowed, err = l.checkRedis(ctx, key)
-	logger.Debug("checked by redis", zap.Bool("allowed", allowed), zap.Error(err))
-	if err != nil {
-		logger.Debug("failed to check redis for rate", zap.Error(err))
-		return true // if we can't check redis, we assume the key is allowed
-	}
+	/*
+		allowed, err = l.checkRedis(ctx, key)
+		logger.Debug("checked by redis", zap.Bool("allowed", allowed), zap.Error(err))
+		if err != nil {
+			logger.Debug("failed to check redis for rate", zap.Error(err))
+			return true // if we can't check redis, we assume the key is allowed
+		}
+	*/
+	allowed = false
 	return allowed
 }
 
