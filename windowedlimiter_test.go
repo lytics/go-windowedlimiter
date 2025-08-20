@@ -66,7 +66,7 @@ func TestConcurrent(t *testing.T) {
 	ctx := t.Context()
 	rate := int64(80)
 	interval := 1000 * time.Millisecond
-	_, l, key := setup(t, ctx, rate, interval, 1*time.Second)
+	_, l, key := setup(t, ctx, rate, interval, 100*time.Millisecond)
 	granularity := 4 // how many chunks to divide each interval into for analysis
 	granularityDuration := time.Duration(interval.Nanoseconds() / int64(granularity))
 

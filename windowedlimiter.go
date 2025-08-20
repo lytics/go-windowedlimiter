@@ -272,11 +272,15 @@ func (l *Limiter[K]) checkRedis(ctx context.Context, key K) (bool, error) {
 	}
 	curIntStart := now.Truncate(keyConf.Interval)
 	prevIntStart := curIntStart.Add(-keyConf.Interval)
-	intervals, err := rdb.MGet(ctx,
-		fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano()),
-		fmt.Sprintf("{%s}.%d", key, prevIntStart.UnixNano()),
-	).Result()
-	if err != nil {
+
+	pipe := rdb.Pipeline()
+	curKey := fmt.Sprintf("{%s}.%d", key, curIntStart.UnixNano())
+	prevKey := fmt.Sprintf("{%s}.%d", key, prevIntStart.UnixNano())
+	curCmd := pipe.Get(ctx, curKey)
+	prevCmd := pipe.Get(ctx, prevKey)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
 		// we failed talking to redis here so we do /not/ try to do any other commands
 		// to it, especially not trying to write to a node that can't even do a read
 		logger.Error("getting intervals", zap.Error(err))
@@ -285,12 +289,23 @@ func (l *Limiter[K]) checkRedis(ctx context.Context, key K) (bool, error) {
 
 	var curr, prev int64
 	var errCurr, errPrev error
-	if intervals[0] != nil {
-		curr, errCurr = strconv.ParseInt(intervals[0].(string), 10, 64)
+
+	curVal, err := curCmd.Result()
+	if err != nil && err != redis.Nil {
+		errCurr = err
 	}
-	if intervals[1] != nil {
-		prev, errPrev = strconv.ParseInt(intervals[1].(string), 10, 64)
+	if curVal != "" {
+		curr, errCurr = strconv.ParseInt(curVal, 10, 64)
 	}
+
+	prevVal, err := prevCmd.Result()
+	if err != nil && err != redis.Nil {
+		errPrev = err
+	}
+	if prevVal != "" {
+		prev, errPrev = strconv.ParseInt(prevVal, 10, 64)
+	}
+
 	if errCurr != nil || errPrev != nil {
 		return false, fmt.Errorf("could not parse interval values, cur: %w, prev: %w", errCurr, errPrev)
 	}
