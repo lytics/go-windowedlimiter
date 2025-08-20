@@ -193,7 +193,7 @@ func (l *Limiter[K]) incrementer(ctx context.Context) {
 			}
 			if keysToIncr[key]*3 > keyConf.Rate {
 				// short-circuit if we already know a key is headed for mitigation
-				l.logger.Debug("key increments over limit, flushing immediately", zap.String("key", key.String()), zap.Int64("count", keysToIncr[key]))
+				l.logger.Debug("key increments approaching limit, flushing immediately", zap.String("key", key.String()), zap.Int64("count", keysToIncr[key]))
 				l.processIncrBatch(ctx, keysToIncr)
 				keysToIncr = make(map[K]int64) // reset the batch after processing
 			}

@@ -33,6 +33,13 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{
 		Addr: mr.Addr(),
 	})
+	keyConfFn := func(ctx context.Context, key rateKey) *windowedlimiter.KeyConf {
+		// Normally you'd hit a database or use a global default
+		return &windowedlimiter.KeyConf{
+			Rate:     1, // 10 requests per second
+			Interval: 10 * time.Second,
+		}
+	}
 
 	rl := windowedlimiter.New[rateKey](
 		context.Background(),
@@ -41,11 +48,13 @@ func main() {
 		windowedlimiter.OptionWithLogger[rateKey](zl),
 	)
 
+	waitReqs := 10
 	startWait := time.Now()
-	for range 100 {
+	for range waitReqs {
 		rl.Wait(context.Background(), rateKey{namespace: "some_expensive_operation", id: "bob"})
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 	}
+	endWait := time.Now()
 
 	startAllow := time.Now()
 	allowed := 0
@@ -53,18 +62,18 @@ func main() {
 		if rl.Allow(context.Background(), rateKey{namespace: "some_other_operation", id: "bob"}) {
 			allowed++
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(5 * time.Second)
 	}
+	endAllow := time.Now()
 
-	zl.Info("Average Rate", zap.String("type", "Wait()"), zap.Float64("rate", 100.0/float64(time.Since(startWait).Seconds())))
-	zl.Info("Average Rate", zap.String("type", "Allow()"), zap.Float64("rate", float64(allowed)/float64(time.Since(startAllow).Seconds())))
+	zl.Info("Average Rate",
+		zap.String("type", "Wait()"),
+		zap.Float64("rate", float64(waitReqs)/float64(endWait.Sub(startWait).Seconds())),
+	)
+	zl.Info("Average Rate",
+		zap.String("type", "Allow()"),
+		zap.Float64("rate", float64(allowed)/float64(endAllow.Sub(startAllow).Seconds())),
+		zap.Int("allowed", allowed),
+	)
 
-}
-
-func keyConfFn(ctx context.Context, key rateKey) *windowedlimiter.KeyConf {
-	// Normally you'd hit a database or use a global default
-	return &windowedlimiter.KeyConf{
-		Rate:     10, // 10 requests per second
-		Interval: 1 * time.Second,
-	}
 }
