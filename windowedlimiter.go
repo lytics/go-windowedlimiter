@@ -112,16 +112,21 @@ type Limiter[K Key] struct {
 
 // Close stops all goroutines, flushes logging, and waits for completion.
 func (l *Limiter[K]) Close() {
+	l.logger.Debug("closing limiter")
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.mitigationCache.CloseAll()
 	select {
 	case l.doneChan <- struct{}{}:
 		// Successfully sent done signal
+		l.logger.Debug("sent done signal to incrementer, waiting for it to finish")
 		l.wg.Wait()
+		l.logger.Debug("incrementer finished")
 	default:
 	}
+	l.logger.Debug("syncing logger")
 	_ = l.logger.Sync()
+	l.logger.Debug("limiter closed")
 }
 
 // SetKeyConfFn sets the KeyConfFn on the limiter and clears all mitigations
@@ -169,7 +174,9 @@ func (l *Limiter[K]) keyConf(ctx context.Context, key K) *KeyConf {
 }
 
 func (l *Limiter[K]) incrementer(ctx context.Context) {
+	l.logger.Debug("starting incrementer")
 	defer l.wg.Done()
+	defer l.logger.Debug("incrementer stopped")
 
 	keysToIncr := make(map[K]int64)
 	ticker := time.NewTicker(l.batchDuration)
@@ -198,6 +205,7 @@ func (l *Limiter[K]) incrementer(ctx context.Context) {
 				keysToIncr = make(map[K]int64) // reset the batch after processing
 			}
 		case <-ticker.C:
+			l.logger.Debug("incrementer tick, processing batch")
 			if len(keysToIncr) == 0 {
 				continue
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -52,27 +53,32 @@ func setupBench(b *testing.B, ctx context.Context, rate int64, interval time.Dur
 	return l, key
 }
 
-func setup(t *testing.T, ctx context.Context, rate int64, interval, batchDuration time.Duration) (*miniredis.Miniredis, *Limiter[rateKey], rateKey) {
+func setup(t *testing.T, ctx context.Context, rate int64, interval, batchDuration time.Duration) (*Limiter[rateKey], rateKey) {
 	t.Helper()
-	mr := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{
-		Addr: mr.Addr(),
-	})
-
 	key := rateKey{key: fmt.Sprintf("%s-%d", t.Name(), time.Now().UnixNano()%1000)}
 	keyConfFn := func(ctx context.Context, key rateKey) *KeyConf {
 		return &KeyConf{Rate: rate, Interval: interval}
 	}
+
+	c, s := net.Pipe()
+	mr := miniredis.RunT(t)
+	mr.Server().Close()      // we have to close the auto-created net.Listen so synctest can be used (real network conns are not durably blocking)
+	mr.Server().ServeConn(s) // the net.Pipe keeps the entire connection visible to synctest
+	rdb := redis.NewClient(&redis.Options{
+		Dialer: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			return c, nil
+		},
+	})
+
 	l := New(ctx, rdb, keyConfFn, OptionWithLogger[rateKey](NewLogger(t)), OptionWithBatchDuration[rateKey](batchDuration))
 	t.Cleanup(func() {
-		l.logger.Info("redis commands", zap.Int("count", mr.CommandCount()))
-		l.Close()
 		_ = rdb.Close()
+		l.Close()
 	})
 	// avoid testing over the first interval wrap, which can cause more requests to
 	// be allowed
 	time.Sleep(time.Until(time.Now().Truncate(interval).Add(interval)))
-	return mr, l, key
+	return l, key
 }
 
 func analyzeIntervals(t *testing.T, logger *zap.Logger, _ time.Duration, granularity int, granularityDuration time.Duration, rate int64, intervals map[time.Time]int64) {
